@@ -23,6 +23,7 @@ import {
   handleResume,
   handleStatus,
   handleUp,
+  isTransientUploadError,
   isNotFoundError,
   parseArgs,
   parsePort,
@@ -33,6 +34,7 @@ import {
   redactExecFailure,
   runDoctorCheck,
   toRemoteAbsolute,
+  uploadFile,
 } from "../../../../skills/sandbox-ctl/scripts/adapters/cube-sandbox-manager.mjs";
 import { readConfig, writeConfig } from "../../../../skills/sandbox-ctl/scripts/project-config.mjs";
 
@@ -415,6 +417,71 @@ describe("cube-sandbox-manager push/pull mode validation", () => {
   it("requires --include-sensitive for full mode and rejects it elsewhere", async () => {
     await expect(handlePush({ directory: mkdtempSync(path.join(tmpdir(), "cube-push-full-")), mode: "full" })).rejects.toThrow(/include-sensitive/i);
     await expect(handlePush({ directory: mkdtempSync(path.join(tmpdir(), "cube-push-bundle-sensitive-")), mode: "bundle", "include-sensitive": true })).rejects.toThrow(/only valid with --mode full/i);
+  });
+
+  it("retries only transient files.write failures with injectable backoff", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-upload-retry-"));
+    try {
+      const localPath = path.join(root, "input.txt");
+      writeFileSync(localPath, "upload me\n");
+      let writes = 0;
+      const sleeps = [];
+      const sandbox = { files: { write: async () => { writes += 1; if (writes < 3) throw new Error("fetch failed"); } } };
+      expect(isTransientUploadError(new Error("fetch failed"))).toBe(true);
+      const result = await uploadFile(sandbox, localPath, "/workspace/input.txt", { backoffMs: 1, sleep: async (ms) => sleeps.push(ms) });
+      expect(result).toEqual({ remotePath: "/workspace/input.txt", attempts: 3, retries: 2 });
+      expect(sleeps).toEqual([1, 2]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("does not retry non-transient files.write validation failures", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-upload-validation-"));
+    try {
+      const localPath = path.join(root, "input.txt");
+      writeFileSync(localPath, "upload me\n");
+      let writes = 0;
+      const sandbox = { files: { write: async () => { writes += 1; throw new Error("invalid remote path"); } } };
+      expect(isTransientUploadError(new Error("invalid remote path"))).toBe(false);
+      await expect(uploadFile(sandbox, localPath, "/bad/input.txt", { sleep: async () => { throw new Error("sleep must not run"); } })).rejects.toThrow(/invalid remote path/);
+      expect(writes).toBe(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("explains that a final transient upload failure is safe to retry", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-upload-final-"));
+    try {
+      const localPath = path.join(root, "input.txt");
+      writeFileSync(localPath, "upload me\n");
+      await expect(uploadFile({ files: { write: async () => { throw new Error("fetch failed"); } } }, localPath, "/workspace/input.txt", { maxAttempts: 2, backoffMs: 0, sleep: async () => {} })).rejects.toThrow(/after 2 files\.write attempts.*safe to retry/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("retries transient push connection acquisition before any upload and reports both retry counts", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-push-connect-retry-"));
+    try {
+      bindConfig(root);
+      const filePath = path.join(root, "note.txt");
+      writeFileSync(filePath, "hello cube\n");
+      const sandbox = fakeSandbox({ commandHandler: (cmd) => ({ exitCode: 0, stdout: cmd.includes("printf") || cmd.includes("passwd") ? "/home/user\n" : "" }) });
+      let connects = 0;
+      const client = { connect: async () => { connects += 1; if (connects === 1) throw new Error("fetch failed"); return sandbox; } };
+      const result = await handlePush({ directory: root, path: filePath, "remote-path": "workspace/dev", client, connectionRetry: { backoffMs: 0, sleep: async () => {} } });
+      expect(result).toMatchObject({ ok: true, connection: { attempts: 2, retries: 1 }, upload: { attempts: 1, retries: 0 } });
+      expect(connects).toBe(2);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("reports an exhausted transient push connection phase as safely retryable without writing", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-push-connect-final-"));
+    try {
+      bindConfig(root);
+      const filePath = path.join(root, "note.txt");
+      writeFileSync(filePath, "hello cube\n");
+      let connects = 0;
+      const client = { connect: async () => { connects += 1; throw new Error("fetch failed"); } };
+      await expect(handlePush({ directory: root, path: filePath, client, connectionRetry: { maxAttempts: 2, backoffMs: 0, sleep: async () => {} } })).rejects.toThrow(/connection\/upload phase failed after 2 connection attempts.*safeToRetry=true/i);
+      expect(connects).toBe(2);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

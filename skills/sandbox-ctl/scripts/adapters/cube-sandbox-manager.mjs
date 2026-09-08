@@ -103,6 +103,10 @@ const DEFAULT_EXEC_TIMEOUT_MS = 300_000;
 // Daytona's default autoStopInterval so an unattended dev sandbox behaves
 // similarly), overridable with `--timeout`.
 const DEFAULT_SANDBOX_TIMEOUT_MS = 1_800_000;
+const DEFAULT_UPLOAD_MAX_ATTEMPTS = 3;
+const DEFAULT_UPLOAD_BACKOFF_MS = 100;
+const DEFAULT_CONNECTION_MAX_ATTEMPTS = 3;
+const DEFAULT_CONNECTION_BACKOFF_MS = 100;
 
 /** Cube's flag surface is fixed (BOOL_FLAGS/STRING_FLAGS); the parsing engine itself lives in lib/cli-shared.mjs so it's shared with Daytona's adapter. */
 function parseArgs(argv = process.argv.slice(2), config = { booleanFlags: BOOL_FLAGS, stringFlags: STRING_FLAGS }) {
@@ -423,9 +427,49 @@ async function resolveRemoteHome(sandbox) {
   throw new Error("Could not determine sandbox remote home from environment or passwd database");
 }
 
-async function uploadFile(sandbox, localPath, remotePath) {
+function isTransientUploadError(error) {
+  const code = String(error?.code ?? error?.cause?.code ?? "").toUpperCase();
+  const status = Number(error?.status ?? error?.statusCode ?? error?.cause?.status ?? error?.cause?.statusCode);
+  if ([408, 425, 429].includes(status) || (status >= 500 && status <= 599)) return true;
+  if (["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "EPIPE", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"].includes(code)) return true;
+  const message = String(error?.message ?? error ?? "");
+  // Node's fetch implementation commonly exposes this as the bare message
+  // "fetch failed", without retaining the lower-level socket error.
+  return /fetch failed|network error|network request failed|socket hang up|connection reset|connection refused|timed out|temporarily unavailable|transport/i.test(message);
+}
+
+const defaultUploadSleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function uploadFile(sandbox, localPath, remotePath, retryOptions = {}) {
   const bytes = readFileSync(localPath);
-  await sandbox.files.write(remotePath, bytes);
+  const maxAttempts = Math.max(1, Math.min(5, Number.isSafeInteger(Number(retryOptions.maxAttempts)) ? Number(retryOptions.maxAttempts) : DEFAULT_UPLOAD_MAX_ATTEMPTS));
+  const backoffMs = Math.max(0, Number.isFinite(Number(retryOptions.backoffMs)) ? Number(retryOptions.backoffMs) : DEFAULT_UPLOAD_BACKOFF_MS);
+  const sleep = typeof retryOptions.sleep === "function" ? retryOptions.sleep : defaultUploadSleep;
+  let attempts = 0;
+  let lastError;
+  while (attempts < maxAttempts) {
+    attempts += 1;
+    try {
+      // Retry scope is intentionally exactly this one SDK mutation. Reading,
+      // extraction, git merge, and remote exec operations remain one-shot.
+      await sandbox.files.write(remotePath, bytes);
+      return { remotePath, attempts, retries: attempts - 1 };
+    } catch (error) {
+      lastError = error;
+      if (!isTransientUploadError(error) || attempts >= maxAttempts) break;
+      await sleep(backoffMs * (2 ** (attempts - 1)));
+    }
+  }
+  if (isTransientUploadError(lastError)) {
+    const wrapped = new Error(`Cube Sandbox upload failed after ${attempts} files.write attempt${attempts === 1 ? "" : "s"} for ${remotePath}: ${lastError?.message ?? lastError}. The upload is safe to retry; no extraction or merge was started.`);
+    wrapped.cause = lastError;
+    wrapped.upload = { remotePath, attempts, retries: Math.max(0, attempts - 1), safeToRetry: true };
+    throw wrapped;
+  }
+  if (lastError && typeof lastError === "object") {
+    lastError.upload = { remotePath, attempts, retries: Math.max(0, attempts - 1), safeToRetry: false };
+  }
+  throw lastError;
 }
 
 async function downloadFile(sandbox, remotePath, localPath) {
@@ -501,6 +545,7 @@ async function requireSandbox(options) {
     sandbox = await client.connect(paths.binding.sandboxId, { timeoutMs: sandboxTimeoutMs });
   } catch (error) {
     if (isNotFoundError(error)) throw new Error(`Cube Sandbox not found or unavailable: ${paths.binding.sandboxId}`);
+    if (error && typeof error === "object") error.connectionPhase = true;
     throw error;
   }
   const remoteHome = paths.binding.remoteHome ?? await resolveRemoteHome(sandbox);
@@ -508,6 +553,36 @@ async function requireSandbox(options) {
     try { upsertBinding(paths.directory, paths.binding.name, { remoteHome, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" }); } catch { /* command can continue; retry persistence next invocation */ }
   }
   return { paths, sandbox, remoteHome };
+}
+
+async function requireSandboxForPush(options) {
+  const retryOptions = options.connectionRetry ?? {};
+  const maxAttempts = Math.max(1, Math.min(5, Number.isSafeInteger(Number(retryOptions.maxAttempts)) ? Number(retryOptions.maxAttempts) : DEFAULT_CONNECTION_MAX_ATTEMPTS));
+  const backoffMs = Math.max(0, Number.isFinite(Number(retryOptions.backoffMs)) ? Number(retryOptions.backoffMs) : DEFAULT_CONNECTION_BACKOFF_MS);
+  const sleep = typeof retryOptions.sleep === "function" ? retryOptions.sleep : defaultUploadSleep;
+  let attempts = 0;
+  let lastError;
+  while (attempts < maxAttempts) {
+    attempts += 1;
+    try {
+      const result = await requireSandbox(options);
+      return { ...result, connection: { attempts, retries: attempts - 1 } };
+    } catch (error) {
+      lastError = error;
+      // Only client.connect failures are retryable here. Once acquisition
+      // succeeds, all remote exec/extraction/merge operations remain one-shot.
+      if (!error?.connectionPhase || !isTransientUploadError(error) || attempts >= maxAttempts) break;
+      await sleep(backoffMs * (2 ** (attempts - 1)));
+    }
+  }
+  if (lastError?.connectionPhase && isTransientUploadError(lastError)) {
+    const wrapped = new Error(`Cube Sandbox push connection/upload phase failed after ${attempts} connection attempt${attempts === 1 ? "" : "s"}: ${lastError?.message ?? lastError}. safeToRetry=true; no upload, extraction, or merge was started.`);
+    wrapped.cause = lastError;
+    wrapped.connection = { attempts, retries: Math.max(0, attempts - 1), safeToRetry: true };
+    wrapped.safeToRetry = true;
+    throw wrapped;
+  }
+  throw lastError;
 }
 
 /** Evict a cached daemon connection so the next exec cannot reuse a paused
@@ -1004,7 +1079,7 @@ async function handlePush(options) {
   if (mode === "git" && requestedWorkspaceOwner) {
     throw new Error(`Git push is not supported with workspace owner ${requestedWorkspaceOwner.uid}:${requestedWorkspaceOwner.gid}; use push --mode bundle or push --mode full`);
   }
-  const { paths, sandbox, remoteHome } = await requireSandbox(options);
+  const { paths, sandbox, remoteHome, connection } = await requireSandboxForPush(options);
   const workspaceOwner = resolveWorkspaceOwner(options, paths.binding);
   const remoteWorkspace = toRemoteAbsolute(options["remote-path"] ?? paths.binding.remoteWorkspace ?? paths.remoteWorkspacePath, remoteHome);
 
@@ -1017,7 +1092,7 @@ async function handlePush(options) {
     try {
       const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
       const remoteBundle = `/tmp/cube-sandbox-git-input-${paths.taskId}-${nonce}.bundle`;
-      await uploadFile(sandbox, bundlePath, remoteBundle);
+      const upload = await uploadFile(sandbox, bundlePath, remoteBundle, options.uploadRetry);
       const tempRefName = `refs/sandbox-ctl-sync/push-${paths.taskId}-${nonce}`;
       const markerSource = shellQuote(sourceHead);
       const markerBranch = shellQuote(branch);
@@ -1079,8 +1154,8 @@ echo "SANDBOX_SNAPSHOT_HEAD=$(git -C \"$target\" rev-parse HEAD)"`);
       const remoteWarnings = [result.stdout, result.stderr].filter(Boolean).flatMap((text) => String(text).split(/\r?\n/)).map((line) => line.trim()).filter((line) => /^Warning: failed to clean/i.test(line));
       for (const warning of remoteWarnings) if (!warnings.includes(warning)) warnings.push(warning);
       upsertBinding(paths.directory, paths.binding.name, { sync: { mode: "git", branch }, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" });
-      console.log(`Uploaded git bundle to ${safeRemoteWorkspace} on branch ${branch}${warnings.length ? `\nWarning: ${warnings[0]}` : ""}`);
-      return { ok: true, mode: "git", remoteWorkspace: safeRemoteWorkspace, branch, sourceHead, snapshotHead: remoteSnapshotHead, includedWip, wipSummary, warnings };
+      console.log(`Uploaded git bundle to ${safeRemoteWorkspace} on branch ${branch} (connection attempts: ${connection.attempts}; files.write attempts: ${upload.attempts})${warnings.length ? `\nWarning: ${warnings[0]}` : ""}`);
+      return { ok: true, mode: "git", remoteWorkspace: safeRemoteWorkspace, branch, sourceHead, snapshotHead: remoteSnapshotHead, includedWip, wipSummary, warnings, connection, upload };
     } finally { cleanup(); }
   }
 
@@ -1098,24 +1173,24 @@ echo "SANDBOX_SNAPSHOT_HEAD=$(git -C \"$target\" rev-parse HEAD)"`);
     const requestedRemotePath = options["remote-path"];
     const explicitRemoteTarget = requestedRemotePath === paths.binding.remoteWorkspace ? undefined : requestedRemotePath;
     const remoteTarget = resolveSingleFileRemoteTarget(explicitRemoteTarget, remoteWorkspace, path.basename(localAbs), remoteHome);
-    await uploadFile(sandbox, localAbs, remoteTarget);
+    const upload = await uploadFile(sandbox, localAbs, remoteTarget, options.uploadRetry);
     if (workspaceOwner) {
       const ownerResult = await cubeSandboxExec(sandbox, `chown ${workspaceOwner.uid}:${workspaceOwner.gid} -- ${shellQuote(remoteTarget)}`);
       assertRemoteCommandSuccess(ownerResult, "single-file ownership update");
     }
-    console.log(`Uploaded file to ${remoteTarget}`);
-    return { ok: true, mode: "file", remoteWorkspace: remoteTarget };
+    console.log(`Uploaded file to ${remoteTarget} (connection attempts: ${connection.attempts}; files.write attempts: ${upload.attempts})`);
+    return { ok: true, mode: "file", remoteWorkspace: remoteTarget, connection, upload };
   }
 
   const { bundlePath, cleanup } = createCubeSandboxBundle(options.path, paths.taskId, { mode, includeSensitive, archiveOwner: workspaceOwner });
   try {
     const remoteBundle = `/tmp/cube-sandbox-input-${paths.taskId}.tar.gz`;
-    await uploadFile(sandbox, bundlePath, remoteBundle);
+    const upload = await uploadFile(sandbox, bundlePath, remoteBundle, options.uploadRetry);
     const tarOwnerFlags = workspaceOwner ? "--same-owner --numeric-owner " : "";
     const result = await cubeSandboxExec(sandbox, `tar ${tarOwnerFlags}--no-overwrite-dir -xzf ${shellQuote(remoteBundle)} -C ${shellQuote(remoteWorkspace)}`);
     assertRemoteCommandSuccess(result, "push extraction");
-    console.log(`Uploaded ${mode} archive to ${remoteWorkspace}`);
-    return { ok: true, mode, remoteWorkspace };
+    console.log(`Uploaded ${mode} archive to ${remoteWorkspace} (connection attempts: ${connection.attempts}; files.write attempts: ${upload.attempts})`);
+    return { ok: true, mode, remoteWorkspace, connection, upload };
   } finally { cleanup(); }
 }
 
@@ -1398,5 +1473,6 @@ export {
   createCubeSandboxOnNode,
   runDoctorCheck,
   toRemoteAbsolute,
+  isTransientUploadError,
   uploadFile,
 };

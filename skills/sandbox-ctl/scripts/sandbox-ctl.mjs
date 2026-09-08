@@ -518,6 +518,10 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
         nextActions: error?.nextActions ?? [],
         failure: error?.failure ?? classifyFailure(error),
         ...(error?.executionId ? { executionId: error.executionId } : {}),
+        ...(error?.dispatchState ? { dispatchState: error.dispatchState } : {}),
+        ...(error?.safeToRetry !== undefined ? { safeToRetry: Boolean(error.safeToRetry) } : {}),
+        ...(error?.connection ? { connection: error.connection } : {}),
+        ...(error?.reconciliationCommand ? { reconciliationCommand: error.reconciliationCommand } : {}),
         ...(error?.remoteStatus ? { remoteStatus: error.remoteStatus } : {}),
       };
       process.exitCode = 125;
@@ -530,7 +534,7 @@ async function runSandboxCtl(argv = process.argv.slice(2), { adapter } = {}) {
       throw error;
     }
     const exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;
-    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: findEffectiveAdapter(argv), exitCode, error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [] };
+    const payload = { ok: false, command: requestedCommand ?? "unknown", adapter: findEffectiveAdapter(argv), exitCode, error: sanitizeError(error), sandboxId: error?.sandboxId ?? null, nextActions: error?.nextActions ?? [], ...(error?.dispatchState ? { dispatchState: error.dispatchState } : {}), ...(error?.safeToRetry !== undefined ? { safeToRetry: Boolean(error.safeToRetry) } : {}), ...(error?.connection ? { connection: error.connection } : {}), ...(error?.reconciliationCommand ? { reconciliationCommand: error.reconciliationCommand } : {}) };
     process.exitCode = exitCode;
     console.log(JSON.stringify(payload));
     return payload;
