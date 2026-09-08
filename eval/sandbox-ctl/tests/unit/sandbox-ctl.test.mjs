@@ -49,6 +49,11 @@ describe("sandbox-ctl argument parsing", () => {
     expect(parsed.passthrough).toEqual(["make", "setup"]);
   });
 
+  it("rejects a second positional push destination and requires --remote-path", () => {
+    expect(() => parseSandboxCtlArgs(["push", "LOCAL", "DEST"])).toThrow(/push LOCAL --remote-path DEST.*second positional/i);
+    expect(parseSandboxCtlArgs(["push", "LOCAL", "--remote-path", "DEST"]).positionals).toEqual(["LOCAL"]);
+  });
+
   it("supports local binding selection and no-use lifecycle controls", () => {
     const parsed = parseSandboxCtlArgs(["up", "--sandbox", "dev", "--name", "named", "--no-use"]);
     expect(parsed.options).toMatchObject({ sandbox: "dev", name: "named", noUse: true });

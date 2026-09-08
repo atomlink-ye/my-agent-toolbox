@@ -117,6 +117,9 @@ function parseSandboxCtlArgs(argv = process.argv.slice(2)) {
     else positionals.push(arg);
   }
   if (!ADAPTERS[adapter]) throw new Error(`Unknown adapter: ${adapter}. Supported adapters: ${Object.keys(ADAPTERS).join(", ")}`);
+  if (command === "push" && positionals.length > 1) {
+    throw new Error("push accepts one local path positional; use push LOCAL --remote-path DEST (a second positional destination is not supported)");
+  }
   return { adapter, adapterExplicit, json, command, positionals, passthrough, options, forwarded, warnings };
 }
 
