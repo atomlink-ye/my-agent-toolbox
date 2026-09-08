@@ -376,6 +376,30 @@ describe("cube-sandbox-manager exec", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it("marks an accepted transport failure as unknown and gives an exact reconciliation command", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-exec-accepted-unknown-"));
+    try {
+      bindConfig(root);
+      const error = Object.assign(new Error("daemon socket closed"), { executionId: "exec-accepted-1", accepted: true, failure: { kind: "proxy_transport" } });
+      const result = await handleExec({ directory: root, daemonClient: { exec: async () => { throw error; } } }, ["true"]);
+      expect(result).toMatchObject({ executionId: "exec-accepted-1", dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false, failure: { dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false } });
+      expect(result.reconciliationCommand).toMatch(/sandbox-ctl --directory .* exec status exec-accepted-1 --json/);
+      expect(result.error).toMatch(/do not blindly retry.*cannot determine.*side effects/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("marks a pre-dispatch daemon failure safe to retry", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "cube-exec-not-dispatched-"));
+    try {
+      bindConfig(root);
+      const error = Object.assign(new Error("daemon unavailable"), { executionId: "exec-not-dispatched", failure: { kind: "daemon_unreachable" } });
+      const result = await handleExec({ directory: root, daemonClient: { exec: async () => { throw error; } } }, ["true"]);
+      expect(result).toMatchObject({ executionId: "exec-not-dispatched", dispatchState: "not_dispatched", safeToRetry: true, failure: { dispatchState: "not_dispatched", safeToRetry: true } });
+      expect(result).not.toHaveProperty("reconciliationCommand");
+      expect(result.error).toMatch(/safe to retry/i);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("rejects direct SDK local timeout recovery before command acceptance", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "cube-direct-exec-timeout-"));
     const previousDisableDaemon = process.env.SANDBOX_CTL_DISABLE_DAEMON;

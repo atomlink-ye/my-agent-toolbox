@@ -90,7 +90,7 @@ import {
   validateTarEntries,
 } from "../lib/transfer.mjs";
 import { createGitBundle, fetchGitBundleIntoBranch, remoteEnsureGitCommand, validateGitBranch } from "../lib/git-sync.mjs";
-import { classifyFailure, createDaemonClient, FAILURE_KINDS, readExecutionRecord, readExecutions, runtimePaths, startDaemon } from "../lib/cube-sandbox-daemon.mjs";
+import { classifyFailure, createDaemonClient, DISPATCH_STATES, FAILURE_KINDS, readExecutionRecord, readExecutions, runtimePaths, startDaemon } from "../lib/cube-sandbox-daemon.mjs";
 import { configStatus, configuredPath, materializeCubeSandboxEnv, readCubeSandboxUserConfig, resolveCubeSandboxValues, writeCubeSandboxUserConfig } from "../lib/cube-sandbox-user-config.mjs";
 
 const BOOL_FLAGS = ["--help", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean", "--keep-state", "--no-use"];
@@ -643,9 +643,42 @@ function redactExecFailure(error) {
   return sanitizeDiagnosticUrls(message);
 }
 
-function daemonUnavailableDiagnostic(error) {
+function reconciliationCommand(executionId, directory = process.cwd()) {
+  const resolvedDirectory = path.resolve(directory);
+  const directoryArg = resolvedDirectory === path.resolve(process.cwd()) ? "" : ` --directory ${shellQuote(resolvedDirectory)}`;
+  const safeExecutionId = /^[A-Za-z0-9._-]+$/.test(String(executionId)) ? String(executionId) : shellQuote(executionId);
+  return `sandbox-ctl${directoryArg} exec status ${safeExecutionId} --json`;
+}
+
+function dispatchDetails(error, executionId, directory = process.cwd()) {
+  const state = error?.dispatchState
+    ?? error?.failure?.dispatchState
+    ?? (error?.accepted ? DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN : DISPATCH_STATES.NOT_DISPATCHED);
+  const acceptedUnknown = state === DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN;
+  return {
+    dispatchState: acceptedUnknown ? DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN : DISPATCH_STATES.NOT_DISPATCHED,
+    safeToRetry: !acceptedUnknown,
+    ...(acceptedUnknown ? { reconciliationCommand: reconciliationCommand(executionId, directory) } : {}),
+  };
+}
+
+function dispatchDiagnostic(error, executionId, directory = process.cwd()) {
+  const details = dispatchDetails(error, executionId, directory);
   const detail = redactExecFailure(error);
-  return `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}. Inspect daemon status and probe another binding before considering a restart.`;
+  if (details.dispatchState === DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN) {
+    return `${detail || "Cube Sandbox command transport failed"}. Submission was attempted but the remote outcome is unknown; do not blindly retry. The reconciliation command only looks up the durable record and cannot determine the command's side effects: ${details.reconciliationCommand}. Probe command-specific side effects before retrying.`;
+  }
+  return `${detail || "Cube Sandbox command was not dispatched"}. Dispatch state: ${DISPATCH_STATES.NOT_DISPATCHED}; safe to retry.`;
+}
+
+function daemonUnavailableDiagnostic(error, executionId, directory = process.cwd()) {
+  const detail = redactExecFailure(error);
+  const details = dispatchDetails(error, executionId, directory);
+  const prefix = `Local Cube Sandbox daemon/proxy is unavailable${detail ? `: ${detail}` : ""}.`;
+  if (details.dispatchState === DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN) {
+    return `${prefix} Submission was attempted but the remote outcome is unknown; do not blindly retry. The reconciliation command only looks up the durable record and cannot determine the command's side effects: ${details.reconciliationCommand}. Probe command-specific side effects before retrying.`;
+  }
+  return `${prefix} Dispatch state: ${DISPATCH_STATES.NOT_DISPATCHED}; safe to retry. Inspect daemon status and probe another binding before considering a restart.`;
 }
 
 function assertWorkspaceOwnership(result, action = "workspace ownership validation") {
@@ -1028,10 +1061,15 @@ async function handleExecViaDaemon(options, command) {
       try { upsertBinding(paths.directory, paths.binding.name, { remoteHome: result.remoteHome, updatedAt: new Date().toISOString() }, { use: false, adapter: "cube-sandbox" }); } catch { /* preserve command result; next direct run can retry */ }
     }
     if (result.error) {
-      const diagnostic = daemonUnavailableDiagnostic(result.error);
+      const effectiveError = { ...result, message: result.error, accepted: result.accepted };
+      const dispatch = dispatchDetails(effectiveError, normalized.executionId, paths.directory);
+      const diagnostic = daemonUnavailableDiagnostic(effectiveError, normalized.executionId, paths.directory);
       normalized.exitCode = 125;
       normalized.error = diagnostic;
-      normalized.failure = result.failure ?? classifyFailure(result, FAILURE_KINDS.PROXY_TRANSPORT);
+      normalized.dispatchState = dispatch.dispatchState;
+      normalized.safeToRetry = dispatch.safeToRetry;
+      if (dispatch.reconciliationCommand) normalized.reconciliationCommand = dispatch.reconciliationCommand;
+      normalized.failure = { ...(result.failure ?? classifyFailure(result, FAILURE_KINDS.PROXY_TRANSPORT)), ...dispatch };
       normalized.stderr = normalized.stderr ? `${normalized.stderr}${normalized.stderr.endsWith("\n") ? "" : "\n"}${diagnostic}\n` : `${diagnostic}\n`;
     }
     if (options.artifacts && !normalized.error) {
@@ -1040,10 +1078,12 @@ async function handleExecViaDaemon(options, command) {
     }
     return normalized;
   } catch (error) {
-    const diagnostic = daemonUnavailableDiagnostic(error);
+    const resolvedExecutionId = error.executionId ?? executionId;
+    const dispatch = dispatchDetails(error, resolvedExecutionId, paths?.directory ?? options.directory ?? process.cwd());
+    const diagnostic = daemonUnavailableDiagnostic(error, resolvedExecutionId, paths?.directory ?? options.directory ?? process.cwd());
     const priorStderr = stderr.join("");
-    const classified = error.failure ?? classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT);
-    return { executionId: error.executionId ?? executionId, exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic, failure: classified, ...(classified.kind === FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN ? { remoteStatus: "unknown" } : {}) };
+    const classified = { ...(error.failure ?? classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT)), ...dispatch };
+    return { executionId: resolvedExecutionId, exitCode: 125, stdout: stdout.join(""), stderr: `${priorStderr}${priorStderr && !priorStderr.endsWith("\n") ? "\n" : ""}${diagnostic}\n`, error: diagnostic, dispatchState: dispatch.dispatchState, safeToRetry: dispatch.safeToRetry, ...(dispatch.reconciliationCommand ? { reconciliationCommand: dispatch.reconciliationCommand } : {}), failure: classified, ...(classified.kind === FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN ? { remoteStatus: "unknown" } : {}) };
   }
 }
 

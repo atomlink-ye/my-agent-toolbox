@@ -53,6 +53,15 @@ export const FAILURE_KINDS = Object.freeze({
   REMOTE_COMMAND: "remote_command",
 });
 
+// These states describe whether an exec request may be replayed safely. They
+// are deliberately separate from the transport failure kind: a socket can be
+// healthy while the remote outcome is still unknown after acceptance.
+export const DISPATCH_STATES = Object.freeze({
+  NOT_DISPATCHED: "not_dispatched",
+  SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN: "submission_attempted_outcome_unknown",
+  OUTCOME_KNOWN: "outcome_known",
+});
+
 function failure(kind, message, extra = {}) {
   return { kind, ...(message ? { message: String(message) } : {}), ...extra };
 }
@@ -222,6 +231,8 @@ function writeExecutions(executionsPath, executions) {
       ...(record.startedAt ? { startedAt: record.startedAt } : {}),
       ...(record.completedAt ? { completedAt: record.completedAt } : {}),
       ...(Number.isInteger(record.exitCode) ? { exitCode: record.exitCode } : {}),
+      ...(record.dispatchState ? { dispatchState: String(record.dispatchState) } : {}),
+      ...(record.safeToRetry !== undefined ? { safeToRetry: Boolean(record.safeToRetry) } : {}),
       ...(record.failure ? { failure: record.failure } : {}),
       ...(record.stdout !== undefined ? { stdout: String(record.stdout) } : {}),
       ...(record.stderr !== undefined ? { stderr: String(record.stderr) } : {}),
@@ -280,6 +291,8 @@ function writeExecutionRecord(executionsDir, record) {
     ...(record.startedAt ? { startedAt: record.startedAt } : {}),
     ...(record.completedAt ? { completedAt: record.completedAt } : {}),
     ...(Number.isInteger(record.exitCode) ? { exitCode: record.exitCode } : {}),
+    ...(record.dispatchState ? { dispatchState: String(record.dispatchState) } : {}),
+    ...(record.safeToRetry !== undefined ? { safeToRetry: Boolean(record.safeToRetry) } : {}),
     ...(record.failure ? { failure: record.failure } : {}),
     ...(record.stdout !== undefined ? { stdout: String(record.stdout) } : {}),
     ...(record.stderr !== undefined ? { stderr: String(record.stderr) } : {}),
@@ -316,6 +329,7 @@ function normalizeResult(result, stdout, stderr) {
     // successful remote command. Treat it as a control/transport failure so a
     // proxy response that only contains diagnostic output cannot become RC=0.
     exitCode: hasExitCode ? result.exitCode : 125,
+    dispatchState: DISPATCH_STATES.OUTCOME_KNOWN,
     stdout: stdout.join(""),
     stderr: stderr.join(""),
     ...(hasExitCode && result.exitCode !== 0 ? { failure: failure(FAILURE_KINDS.REMOTE_COMMAND, "Remote command exited with a non-zero status", { remoteExitCode: result.exitCode }) } : {}),
@@ -388,20 +402,19 @@ export function createDaemonServer(options = {}) {
     if (request.op !== "exec") throw protocolError(`Unsupported daemon operation: ${request.op}`);
     const executionId = String(request.executionId || randomUUID());
     const now = new Date().toISOString();
-    let record = { executionId, sandboxId: request.sandboxId, status: "pending", createdAt: now, updatedAt: now };
+    let record = { executionId, sandboxId: request.sandboxId, status: "pending", dispatchState: DISPATCH_STATES.NOT_DISPATCHED, safeToRetry: true, createdAt: now, updatedAt: now };
     writeExecutionRecord(paths.executionsDir, record);
     let entry;
     try {
       entry = await getConnection(request.sandboxId, request.remoteHome, request.sandboxTimeoutMs);
     } catch (error) {
-      const classified = failure(FAILURE_KINDS.SANDBOX_CONNECT, "Sandbox connection failed");
+      const classified = failure(FAILURE_KINDS.SANDBOX_CONNECT, "Sandbox connection failed", { dispatchState: DISPATCH_STATES.NOT_DISPATCHED, safeToRetry: true });
       record = { ...record, status: "failed", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), exitCode: 125, failure: classified };
       writeExecutionRecord(paths.executionsDir, record);
       throw protocolError(error?.message || String(error), { failure: classified, executionId });
     }
     const { sandbox, remoteHome } = entry;
-    onAccepted();
-    record = { ...record, status: "running", startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    record = { ...record, status: "running", dispatchState: DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN, safeToRetry: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     writeExecutionRecord(paths.executionsDir, record);
     const stdout = [];
     const stderr = [];
@@ -419,6 +432,9 @@ export function createDaemonServer(options = {}) {
     };
     if (Number.isFinite(Number(request.remoteTimeoutMs)) && Number(request.remoteTimeoutMs) > 0) runOptions.timeoutMs = Number(request.remoteTimeoutMs);
     let result;
+    // The daemon's accepted frame means submission is about to be attempted;
+    // it does not prove that the remote SDK accepted or started the command.
+    onAccepted();
     try {
       result = await sandbox.commands.run(String(request.command || ""), runOptions);
     } catch (error) {
@@ -431,9 +447,9 @@ export function createDaemonServer(options = {}) {
           : FAILURE_KINDS.SANDBOX_STALE_CONNECTION;
         const classified = failure(kind, kind === FAILURE_KINDS.PROXY_TRANSPORT
           ? "Cube Sandbox command transport timed out before a remote result was returned"
-          : "Cached sandbox connection failed before a remote result was returned");
+          : "Cached sandbox connection failed before a remote result was returned", { dispatchState: DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN, safeToRetry: false });
         const completedAt = new Date().toISOString();
-        record = { ...record, status: "failed", updatedAt: completedAt, completedAt, exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), failure: classified };
+        record = { ...record, status: "failed", dispatchState: DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN, safeToRetry: false, updatedAt: completedAt, completedAt, exitCode: 125, stdout: stdout.join(""), stderr: stderr.join(""), failure: classified };
         writeExecutionRecord(paths.executionsDir, record);
         throw protocolError(error?.message || String(error), { failure: classified, executionId, exitCode: 125, stdout: stdout.join(""), stderr: stderr.join("") });
       }
@@ -443,7 +459,7 @@ export function createDaemonServer(options = {}) {
     if (!stdout.length && result?.stdout) emit("stdout", result.stdout);
     if (!stderr.length && result?.stderr) emit("stderr", result.stderr);
     const normalized = { ...normalizeResult(result, stdout, stderr), remoteHome, executionId };
-    record = { ...record, status: "completed", updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), exitCode: normalized.exitCode, stdout: normalized.stdout, stderr: normalized.stderr, ...(normalized.failure ? { failure: normalized.failure } : {}) };
+    record = { ...record, status: "completed", dispatchState: undefined, safeToRetry: undefined, updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), exitCode: normalized.exitCode, stdout: normalized.stdout, stderr: normalized.stderr, ...(normalized.failure ? { failure: normalized.failure } : {}) };
     writeExecutionRecord(paths.executionsDir, record);
     return normalized;
   }
@@ -468,7 +484,7 @@ export function createDaemonServer(options = {}) {
         try { request = JSON.parse(line); } catch { send({ version: PROTOCOL_VERSION, type: "result", exitCode: 125, error: "Invalid daemon JSON request" }); continue; }
         Promise.resolve(handleRequest(request, send, () => send({ version: PROTOCOL_VERSION, id: request.id, type: "accepted", executionId: request.executionId }))).then((result) => send({ version: PROTOCOL_VERSION, id: request.id, type: "result", ...result })).catch((error) => {
           const classified = error?.failure ?? failure(FAILURE_KINDS.PROXY_TRANSPORT);
-          send({ version: PROTOCOL_VERSION, id: request.id, type: "result", exitCode: Number.isInteger(error?.exitCode) ? error.exitCode : 125, error: `Cube Sandbox control failure (${classified.kind})`, failure: classified, ...(error?.executionId ? { executionId: error.executionId } : {}), ...(error?.stdout !== undefined ? { stdout: error.stdout } : {}), ...(error?.stderr !== undefined ? { stderr: error.stderr } : {}) });
+          send({ version: PROTOCOL_VERSION, id: request.id, type: "result", exitCode: Number.isInteger(error?.exitCode) ? error.exitCode : 125, error: `Cube Sandbox control failure (${classified.kind})`, failure: classified, ...(classified.dispatchState ? { dispatchState: classified.dispatchState } : {}), ...(classified.safeToRetry !== undefined ? { safeToRetry: classified.safeToRetry } : {}), ...(error?.executionId ? { executionId: error.executionId } : {}), ...(error?.stdout !== undefined ? { stdout: error.stdout } : {}), ...(error?.stderr !== undefined ? { stderr: error.stderr } : {}) });
         });
       }
     });
@@ -514,13 +530,40 @@ export function createDaemonClient(options = {}) {
       const id = payload.id || randomUUID();
       const executionId = payload.op === "exec" ? String(payload.executionId || randomUUID()) : undefined;
       const stdout = []; const stderr = [];
-      let buffer = ""; let settled = false; let accepted = false;
+      let buffer = ""; let settled = false; let accepted = false; let requestWritten = false;
+      const submissionAttempted = () => payload.op === "exec" && (accepted || requestWritten);
+      const dispatchStateForTransport = () => submissionAttempted() ? DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN : DISPATCH_STATES.NOT_DISPATCHED;
       const finish = (fn, value) => { if (settled) return; settled = true; socket.destroy(); fn(value); };
-      const timer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}`, { executionId, failure: failure(FAILURE_KINDS.DAEMON_UNREACHABLE), accepted })), connectTimeoutMs);
+      const timer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}`, {
+        executionId,
+        accepted,
+        dispatchState: dispatchStateForTransport(),
+        safeToRetry: !submissionAttempted(),
+        failure: failure(submissionAttempted() ? FAILURE_KINDS.PROXY_TRANSPORT : FAILURE_KINDS.DAEMON_UNREACHABLE, undefined, {
+          dispatchState: dispatchStateForTransport(),
+          safeToRetry: !submissionAttempted(),
+        }),
+      })), connectTimeoutMs);
       let requestTimer;
       const requestDeadlineMs = daemonRequestDeadline(payload, options);
       socket.setEncoding("utf8");
-      socket.on("connect", () => { clearTimeout(timer); requestTimer = setTimeout(() => finish(reject, protocolError(`Cube Sandbox daemon request timed out`, { accepted, executionId, exitCode: 125, remoteStatus: "unknown", failure: failure(FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN, "Remote execution status is unknown") })), requestDeadlineMs); socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, id, ...payload, ...(executionId ? { executionId } : {}) })}\n`); });
+      socket.on("connect", () => {
+        clearTimeout(timer);
+        requestTimer = setTimeout(() => {
+          const dispatchState = dispatchStateForTransport();
+          finish(reject, protocolError(`Cube Sandbox daemon request timed out`, {
+            accepted,
+            executionId,
+            exitCode: 125,
+            remoteStatus: "unknown",
+            dispatchState,
+            safeToRetry: !submissionAttempted(),
+            failure: failure(FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN, submissionAttempted() ? "Remote execution status is unknown" : "Cube Sandbox command was not dispatched", { dispatchState, safeToRetry: !submissionAttempted() }),
+          }));
+        }, requestDeadlineMs);
+        requestWritten = true;
+        socket.write(`${JSON.stringify({ version: PROTOCOL_VERSION, id, ...payload, ...(executionId ? { executionId } : {}) })}\n`);
+      });
       socket.on("data", (chunk) => {
         buffer += chunk;
         let newline;
@@ -530,11 +573,52 @@ export function createDaemonClient(options = {}) {
           if (frame.type === "accepted") { accepted = true; }
           else if (frame.type === "stdout") { stdout.push(String(frame.data ?? "")); onStdout?.(frame.data); }
           else if (frame.type === "stderr") { stderr.push(String(frame.data ?? "")); onStderr?.(frame.data); }
-          else if (frame.type === "result") { clearTimeout(timer); clearTimeout(requestTimer); finish(resolve, { ...frame, stdout: frame.stdout ?? stdout.join(""), stderr: frame.stderr ?? stderr.join("") }); }
+          else if (frame.type === "result") {
+            clearTimeout(timer); clearTimeout(requestTimer);
+            const legacyTransportFailure = !frame.dispatchState && !frame.failure?.dispatchState && submissionAttempted() && (
+              Boolean(frame.error)
+              || [FAILURE_KINDS.PROXY_TRANSPORT, FAILURE_KINDS.DAEMON_UNREACHABLE, FAILURE_KINDS.DAEMON_IDENTITY_MISMATCH, FAILURE_KINDS.SANDBOX_CONNECT, FAILURE_KINDS.SANDBOX_STALE_CONNECTION, FAILURE_KINDS.LOCAL_TIMEOUT_REMOTE_UNKNOWN].includes(frame.failure?.kind)
+            );
+            const effectiveDispatchState = legacyTransportFailure ? DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN : (frame.dispatchState ?? frame.failure?.dispatchState);
+            const effectiveSafeToRetry = legacyTransportFailure ? false : (frame.safeToRetry ?? (effectiveDispatchState === DISPATCH_STATES.NOT_DISPATCHED));
+            const frameFailure = legacyTransportFailure
+              ? { ...(frame.failure ?? (frame.error ? { kind: FAILURE_KINDS.PROXY_TRANSPORT } : {})), dispatchState: DISPATCH_STATES.SUBMISSION_ATTEMPTED_OUTCOME_UNKNOWN, safeToRetry: false }
+              : frame.failure;
+            finish(resolve, {
+              ...frame,
+              ...(Object.keys(frameFailure ?? {}).length ? { failure: frameFailure } : {}),
+              stdout: frame.stdout ?? stdout.join(""),
+              stderr: frame.stderr ?? stderr.join(""),
+              ...(effectiveDispatchState ? { dispatchState: effectiveDispatchState } : {}),
+              ...(frame.safeToRetry !== undefined || legacyTransportFailure ? { safeToRetry: effectiveSafeToRetry } : {}),
+            });
+          }
         }
       });
-      socket.on("error", (error) => { clearTimeout(timer); clearTimeout(requestTimer); finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}: ${error.message}`, { accepted, executionId, failure: failure(FAILURE_KINDS.DAEMON_UNREACHABLE) })); });
-      socket.on("close", () => { if (!settled) { clearTimeout(timer); clearTimeout(requestTimer); finish(reject, protocolError(`Cube Sandbox daemon closed before returning a result`, { accepted, executionId, failure: accepted ? failure(FAILURE_KINDS.PROXY_TRANSPORT) : failure(FAILURE_KINDS.DAEMON_UNREACHABLE) })); } });
+      socket.on("error", (error) => {
+        clearTimeout(timer); clearTimeout(requestTimer);
+        const dispatchState = dispatchStateForTransport();
+        finish(reject, protocolError(`Cube Sandbox daemon is unreachable at ${socketPath}: ${error.message}`, {
+          accepted,
+          executionId,
+          dispatchState,
+          safeToRetry: !submissionAttempted(),
+          failure: failure(submissionAttempted() ? FAILURE_KINDS.PROXY_TRANSPORT : FAILURE_KINDS.DAEMON_UNREACHABLE, undefined, { dispatchState, safeToRetry: !submissionAttempted() }),
+        }));
+      });
+      socket.on("close", () => {
+        if (!settled) {
+          clearTimeout(timer); clearTimeout(requestTimer);
+          const dispatchState = dispatchStateForTransport();
+          finish(reject, protocolError(`Cube Sandbox daemon closed before returning a result`, {
+            accepted,
+            executionId,
+            dispatchState,
+            safeToRetry: !submissionAttempted(),
+            failure: failure(submissionAttempted() ? FAILURE_KINDS.PROXY_TRANSPORT : FAILURE_KINDS.DAEMON_UNREACHABLE, undefined, { dispatchState, safeToRetry: !submissionAttempted() }),
+          }));
+        }
+      });
     });
   }
   return {

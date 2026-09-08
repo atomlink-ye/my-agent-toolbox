@@ -269,10 +269,87 @@ describe("Cube Sandbox daemon protocol", () => {
     }, async (server) => {
       const executionId = "exec-accepted-transport";
       const result = await createDaemonClient({ socketPath: server.socketPath }).exec({ executionId, sandboxId: "sbx-transport", command: "echo accepted" });
-      expect(result).toMatchObject({ executionId, exitCode: 125, failure: { kind: "sandbox_stale_connection" }, stdout: "partial-out\n", stderr: "partial-err\n" });
+      expect(result).toMatchObject({ executionId, exitCode: 125, dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false, failure: { kind: "sandbox_stale_connection", dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false }, stdout: "partial-out\n", stderr: "partial-err\n" });
       const record = await createDaemonClient({ socketPath: server.socketPath }).execResult(executionId);
-      expect(record).toMatchObject({ executionId, status: "failed", exitCode: 125, failure: { kind: "sandbox_stale_connection" }, stdout: "partial-out\n", stderr: "partial-err\n", completedAt: expect.any(String) });
+      expect(record).toMatchObject({ executionId, status: "failed", exitCode: 125, dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false, failure: { kind: "sandbox_stale_connection", dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false }, stdout: "partial-out\n", stderr: "partial-err\n", completedAt: expect.any(String) });
     });
+  });
+
+  it("fails closed when a legacy daemon result follows the submission-attempted frame", async () => {
+    const runtimeDir = testRuntimeDir();
+    const paths = testPaths(runtimeDir);
+    const legacy = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      socket.on("data", () => {
+        socket.write(`${JSON.stringify({ version: 1, type: "accepted", executionId: "exec-legacy" })}\n`);
+        socket.write(`${JSON.stringify({ version: 1, type: "result", executionId: "exec-legacy", exitCode: 125, error: "legacy transport failure" })}\n`);
+      });
+    });
+    await new Promise((resolve) => legacy.listen(paths.socketPath, resolve));
+    try {
+      const result = await createDaemonClient({ socketPath: paths.socketPath }).exec({ executionId: "exec-legacy", sandboxId: "sbx-legacy", command: "true" });
+      expect(result).toMatchObject({ executionId: "exec-legacy", dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false, failure: { kind: "proxy_transport", dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false } });
+    } finally {
+      await new Promise((resolve) => legacy.close(resolve));
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a legacy successful result as outcome-known", async () => {
+    const runtimeDir = testRuntimeDir();
+    const paths = testPaths(runtimeDir);
+    const legacy = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      socket.on("data", () => {
+        socket.write(`${JSON.stringify({ version: 1, type: "accepted", executionId: "exec-legacy-success" })}\n`);
+        socket.write(`${JSON.stringify({ version: 1, type: "result", executionId: "exec-legacy-success", exitCode: 0, stdout: "ok\n", stderr: "" })}\n`);
+      });
+    });
+    await new Promise((resolve) => legacy.listen(paths.socketPath, resolve));
+    try {
+      const result = await createDaemonClient({ socketPath: paths.socketPath }).exec({ executionId: "exec-legacy-success", sandboxId: "sbx-legacy", command: "true" });
+      expect(result).toMatchObject({ executionId: "exec-legacy-success", exitCode: 0, stdout: "ok\n" });
+      expect(result).not.toHaveProperty("dispatchState");
+      expect(result).not.toHaveProperty("failure");
+    } finally {
+      await new Promise((resolve) => legacy.close(resolve));
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a legacy known remote exit without synthesizing unknown transport state", async () => {
+    const runtimeDir = testRuntimeDir();
+    const paths = testPaths(runtimeDir);
+    const legacy = net.createServer((socket) => {
+      socket.setEncoding("utf8");
+      socket.on("data", () => {
+        socket.write(`${JSON.stringify({ version: 1, type: "accepted", executionId: "exec-legacy-exit" })}\n`);
+        socket.write(`${JSON.stringify({ version: 1, type: "result", executionId: "exec-legacy-exit", exitCode: 7, failure: { kind: "remote_command", remoteExitCode: 7 } })}\n`);
+      });
+    });
+    await new Promise((resolve) => legacy.listen(paths.socketPath, resolve));
+    try {
+      const result = await createDaemonClient({ socketPath: paths.socketPath }).exec({ executionId: "exec-legacy-exit", sandboxId: "sbx-legacy", command: "false" });
+      expect(result).toMatchObject({ executionId: "exec-legacy-exit", exitCode: 7, failure: { kind: "remote_command", remoteExitCode: 7 } });
+      expect(result).not.toHaveProperty("dispatchState");
+      expect(result).not.toHaveProperty("safeToRetry");
+    } finally {
+      await new Promise((resolve) => legacy.close(resolve));
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a lost daemon acknowledgement after request write as unknown and unsafe", async () => {
+    const runtimeDir = testRuntimeDir();
+    const paths = testPaths(runtimeDir);
+    const server = net.createServer((socket) => { socket.on("data", () => socket.destroy()); });
+    await new Promise((resolve) => server.listen(paths.socketPath, resolve));
+    try {
+      await expect(createDaemonClient({ socketPath: paths.socketPath }).exec({ executionId: "exec-lost-ack", sandboxId: "sbx-lost-ack", command: "true", localWaitTimeoutMs: 50 })).rejects.toMatchObject({ executionId: "exec-lost-ack", dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false, failure: { dispatchState: "submission_attempted_outcome_unknown", safeToRetry: false } });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
   });
 
   it("retains an execution record after the client times out and disconnects", async () => {
