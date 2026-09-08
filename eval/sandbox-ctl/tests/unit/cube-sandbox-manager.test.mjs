@@ -706,6 +706,57 @@ describe("cube-sandbox-manager list/doctor", () => {
     expect(result).toMatchObject({ apiKeyConfigured: true, apiUrlConfigured: true, connected: true, category: "ok" });
   });
 
+  it("doctor reachability separates scheduler listing from daemon exec usability", async () => {
+    const calls = [];
+    const client = {
+      list: () => {
+        let hasNext = true;
+        return { get hasNext() { return hasNext; }, nextItems: async () => { hasNext = false; return [{ sandboxId: "run-1", name: "ready", state: "running" }, { sandboxId: "paused-1", name: "paused", state: "paused" }]; } };
+      },
+    };
+    const daemon = { exec: async (request) => { calls.push(request); return { executionId: request.executionId, exitCode: 0, stdout: "", stderr: "" }; } };
+    const result = await runDoctorCheck({
+      createClient: async () => client,
+      daemonClient: daemon,
+      reachability: true,
+      env: { CUBE_API_KEY: "k", CUBE_API_URL: "http://127.0.0.1:3000" },
+    });
+    expect(result).toMatchObject({ connected: true, category: "reachability_error", listing: { connected: true, sandboxesListed: 2 }, reachability: { requested: true, controlChannel: "daemon_exec_true", scope: expect.stringMatching(/does not prove files\.write transfer or direct SDK reachability/) } });
+    expect(result.reachability.probes).toHaveLength(2);
+    expect(result.reachability.probes.find((probe) => probe.id === "run-1")).toMatchObject({ name: "ready", listedState: "running", reachable: true, probed: true });
+    expect(result.reachability.probes.find((probe) => probe.id === "paused-1")).toMatchObject({ name: "paused", listedState: "paused", reachable: false, probed: false, failure: { kind: "not_running" } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ sandboxId: "run-1", command: "true" });
+  });
+
+  it("doctor reachability can filter by sandbox id without treating listing as reachability", async () => {
+    const calls = [];
+    const client = { list: () => { let hasNext = true; return { get hasNext() { return hasNext; }, nextItems: async () => { hasNext = false; return [{ sandboxId: "run-1", name: "ready", state: "running" }, { sandboxId: "run-2", name: "other", state: "running" }]; } }; } };
+    const daemon = { exec: async (request) => { calls.push(request); return { executionId: request.executionId, exitCode: 9, failure: { kind: "remote_command" } }; } };
+    const result = await runDoctorCheck({ createClient: async () => client, daemonClient: daemon, reachability: true, sandbox: "run-2", env: { CUBE_API_KEY: "k", CUBE_API_URL: "http://127.0.0.1:3000" } });
+    expect(result.reachability).toMatchObject({ filter: "run-2", listed: 1, allReachable: false });
+    expect(result.sandboxes).toEqual([expect.objectContaining({ id: "run-2", reachable: false, failure: { kind: "remote_command" } })]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sandboxId).toBe("run-2");
+  });
+
+  it("doctor reachability does not report an empty listing as healthy", async () => {
+    const result = await runDoctorCheck({ createClient: async () => ({ list: () => ({ hasNext: true, nextItems: async () => [] }) }), reachability: true, env: { CUBE_API_KEY: "k", CUBE_API_URL: "http://127.0.0.1:3000" } });
+    expect(result).toMatchObject({ connected: true, category: "reachability_error", listing: { connected: true, sandboxesListed: 0 }, reachability: { allReachable: false } });
+  });
+
+  it("doctor reachability preserves listing health when daemon setup fails", async () => {
+    let hasNext = true;
+    const result = await runDoctorCheck({
+      createClient: async () => ({ list: () => ({ get hasNext() { return hasNext; }, nextItems: async () => { hasNext = false; return [{ sandboxId: "run-1", name: "ready", state: "running" }]; } }) }),
+      reachability: true,
+      daemonClient: async () => { throw new Error("daemon unreachable"); },
+      env: { CUBE_API_KEY: "k", CUBE_API_URL: "http://127.0.0.1:3000" },
+    });
+    expect(result).toMatchObject({ connected: true, listing: { connected: true }, category: "reachability_error", reachability: { allReachable: false } });
+    expect(result.sandboxes[0]).toMatchObject({ id: "run-1", reachable: false, probed: false, phase: "setup", failure: { kind: expect.any(String) } });
+  });
+
   it("handleDoctor never throws and always prints JSON", async () => {
     const userConfig = missingUserConfig("cube-doctor-handler");
     const previousUserConfig = process.env.SANDBOX_CTL_USER_CONFIG;

@@ -93,7 +93,7 @@ import { createGitBundle, fetchGitBundleIntoBranch, remoteEnsureGitCommand, vali
 import { classifyFailure, createDaemonClient, DISPATCH_STATES, FAILURE_KINDS, readExecutionRecord, readExecutions, runtimePaths, startDaemon } from "../lib/cube-sandbox-daemon.mjs";
 import { configStatus, configuredPath, materializeCubeSandboxEnv, readCubeSandboxUserConfig, resolveCubeSandboxValues, writeCubeSandboxUserConfig } from "../lib/cube-sandbox-user-config.mjs";
 
-const BOOL_FLAGS = ["--help", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean", "--keep-state", "--no-use"];
+const BOOL_FLAGS = ["--help", "--include-sensitive", "--overwrite", "--committed-only", "--require-clean", "--keep-state", "--no-use", "--reachability"];
 const STRING_FLAGS = ["--directory", "--task-id", "--template", "--name", "--path", "--remote-path", "--mode", "--cwd", "--output", "--artifacts", "--sandbox", "--sandbox-id", "--sandbox-name", "--branch", "--port", "--timeout", "--workspace-owner", "--node"];
 const SECRET_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL)/i;
 const SENSITIVE_BASENAME_RE = /^(\.env(?:\..*)?|\.git|node_modules|dist|build|\.claude|\.opencode-state|\.daytona|\.sandbox-ctl|logs|.+\.log)$/;
@@ -1442,16 +1442,83 @@ function sanitizeDiagnostic(value, env = {}) {
   return sanitizeDiagnosticUrls(message);
 }
 
-async function runDoctorCheck({ createClient: makeClient, env = process.env } = {}) {
+async function listCubeSandboxInfos(client) {
+  if (!client || typeof client.list !== "function") throw new Error("Cube Sandbox/e2b SDK list API unavailable");
+  const paginator = client.list();
+  const sandboxes = [];
+  while (paginator.hasNext) {
+    const items = await paginator.nextItems();
+    if (!items?.length) break;
+    for (const info of items) sandboxes.push(info);
+  }
+  return sandboxes;
+}
+
+async function runDoctorCheck({ createClient: makeClient, env = process.env, reachability = false, sandbox: sandboxFilter, daemonClient, daemon, startDaemon: startDaemonFn = startDaemon, reachabilityTimeoutMs = 10_000 } = {}) {
   const resolved = resolveCubeSandboxEnv(env);
   const apiKeyConfigured = Boolean(resolved.apiKey);
   const apiUrlConfigured = Boolean(resolved.apiUrl);
   try {
     const client = await makeClient();
-    if (!client || typeof client.list !== "function") throw new Error("Cube Sandbox/e2b SDK list API unavailable");
-    const paginator = client.list();
-    await paginator.nextItems();
-    return { apiKeyConfigured, apiUrlConfigured, connected: true, category: "ok" };
+    const listed = await listCubeSandboxInfos(client);
+    const base = { apiKeyConfigured, apiUrlConfigured, connected: true, category: "ok", listing: { connected: true, sandboxesListed: listed.length } };
+    if (!reachability) return base;
+
+    const filter = sandboxFilter ?? "";
+    const selected = filter ? listed.filter((info) => String(info.sandboxId ?? info.id) === String(filter) || String(info.name ?? "") === String(filter)) : listed;
+    let control;
+    let controlSetupFailure;
+    if (selected.some((info) => String(info.state ?? "").toLowerCase() === "running")) {
+      try {
+        control = daemonClient
+          ? (typeof daemonClient === "function" ? await daemonClient() : daemonClient)
+          : createDaemonClient(daemon ?? {});
+        if (!daemonClient) await startDaemonFn(daemon ?? {});
+      } catch (error) {
+        controlSetupFailure = error;
+      }
+    }
+    const probes = [];
+    for (const info of selected) {
+      const id = info.sandboxId ?? info.id;
+      const name = info.name ?? null;
+      const listedState = info.state ?? "unknown";
+      if (String(listedState).toLowerCase() !== "running") {
+        probes.push({ id, name, listedState, reachable: false, probed: false, failure: { kind: "not_running", message: `Scheduler lists sandbox as ${listedState}; control-channel probe skipped` } });
+        continue;
+      }
+      const executionId = randomUUID();
+      if (!control) {
+        probes.push({ id, name, listedState, reachable: false, probed: false, phase: "setup", executionId, failure: controlSetupFailure?.failure ?? classifyFailure(controlSetupFailure ?? new Error("Cube Sandbox daemon control channel unavailable"), FAILURE_KINDS.PROXY_TRANSPORT) });
+        continue;
+      }
+      try {
+        const result = await control.exec({ executionId, sandboxId: id, command: "true", localWaitTimeoutMs: reachabilityTimeoutMs });
+        const reachable = result?.error === undefined && result?.exitCode === 0;
+        probes.push({ id, name, listedState, reachable, probed: true, ...(reachable ? {} : { failure: result?.failure ?? { kind: "control_channel_failed", message: result?.error ?? `Exec probe exited with code ${result?.exitCode ?? "unknown"}` }, executionId }) });
+      } catch (error) {
+        probes.push({ id, name, listedState, reachable: false, probed: true, executionId, failure: error?.failure ?? classifyFailure(error, FAILURE_KINDS.PROXY_TRANSPORT), ...(error?.dispatchState ? { dispatchState: error.dispatchState } : {}), ...(error?.safeToRetry !== undefined ? { safeToRetry: Boolean(error.safeToRetry) } : {}) });
+      }
+    }
+    // An empty unfiltered listing is a healthy scheduler result with no
+    // running sandboxes to probe; an explicit filter that matches nothing is
+    // a reachability failure because the requested sandbox was not listed.
+    const allReachable = selected.length > 0 && probes.every((probe) => probe.reachable === true);
+    return {
+      ...base,
+      ok: allReachable && selected.length === probes.length,
+      category: allReachable && selected.length === probes.length ? "ok" : "reachability_error",
+      reachability: {
+        requested: true,
+        filter: filter || null,
+        listed: selected.length,
+        allReachable,
+        probes,
+        controlChannel: "daemon_exec_true",
+        scope: "exec control-channel reachability only; does not prove files.write transfer or direct SDK reachability",
+      },
+      sandboxes: probes,
+    };
   } catch (cause) {
     return { apiKeyConfigured, apiUrlConfigured, connected: false, category: "connection_error", error: sanitizeDiagnostic(cause?.message ?? cause, env) };
   }
@@ -1462,8 +1529,17 @@ const cubeExec = cubeSandboxExec;
 
 async function handleDoctor(options = {}) {
   try {
-    const result = await runDoctorCheck({ createClient: options.createClient ?? createClient, env: process.env });
-    result.ok = result.connected;
+    const result = await runDoctorCheck({
+      createClient: options.createClient ?? createClient,
+      env: options.env ?? process.env,
+      reachability: Boolean(options.reachability),
+      sandbox: options.sandbox ?? options["sandbox-id"] ?? options["sandbox-name"],
+      daemonClient: options.daemonClient,
+      daemon: options.daemon,
+      startDaemon: options.startDaemon,
+      reachabilityTimeoutMs: options.reachabilityTimeoutMs,
+    });
+    result.ok = result.connected && (!options.reachability || result.reachability?.allReachable === true);
     result.checks = { apiKeyConfigured: result.apiKeyConfigured, apiUrlConfigured: result.apiUrlConfigured };
     console.log(JSON.stringify(result, null, 2));
     return result;
