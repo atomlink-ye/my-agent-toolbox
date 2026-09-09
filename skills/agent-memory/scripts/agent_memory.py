@@ -24,12 +24,35 @@ from memory_lifecycle import update_lifecycle
 from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 from memory_store_ext import (
     connect_db,
+    connect_db_readonly,
     link_graph,
     list_documents,
     search_documents,
     status,
     sync_index,
 )
+
+
+READ_ONLY_DB_COMMANDS = {
+    "status",
+    "search",
+    "list",
+    "links",
+    "projects",
+    "tags",
+    "browse",
+}
+
+
+def _readonly_connection(db: Path):
+    connection, used_immutable = connect_db_readonly(db)
+    if used_immutable:
+        print(
+            "agent-memory: warning: read-only WAL access unavailable; "
+            "using an immutable index view",
+            file=sys.stderr,
+        )
+    return connection
 
 
 def _human_links(result):
@@ -307,8 +330,7 @@ def main(argv=None):
             _emit(r, "doctor", a.output_format)
             return 2
         try:
-            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            c.row_factory = sqlite3.Row
+            c = _readonly_connection(db)
             r = doctor(c, settings, sp, db, a.path)
             c.close()
             _emit(r, "doctor", a.output_format)
@@ -352,12 +374,7 @@ def main(argv=None):
             # Validate all routing config before a query opens/initializes SQLite.
             flatten_bindings(settings)
             shared_roots(settings, sp)
-        c = connect_db(db)
-        if a.command == "status":
-            r = status(c, sp, db)
-        elif a.command == "sync":
-            r = sync_index(c, collect_memory_roots(settings, sp))
-        elif a.command == "resolve":
+        if a.command == "resolve":
             b = resolve_binding(settings, a.path)
             pref = preferred_capture_root(settings, b)
             r = {
@@ -365,7 +382,8 @@ def main(argv=None):
                 "project": b.project,
                 "binding": str(b.path),
                 "memory": [
-                    {"path": str(x.path), "tags": list(x.tags)} for x in b.memory_roots
+                    {"path": str(x.path), "tags": list(x.tags)}
+                    for x in b.memory_roots
                 ],
                 "capture_root": (
                     str(pref)
@@ -379,6 +397,17 @@ def main(argv=None):
                 "shared": [str(x.path) for x in shared_roots(settings, sp)],
                 "tags": list(b.tags),
             }
+            _emit(r, a.command, a.output_format)
+            return 0
+        c = (
+            _readonly_connection(db)
+            if a.command in READ_ONLY_DB_COMMANDS
+            else connect_db(db)
+        )
+        if a.command == "status":
+            r = status(c, sp, db)
+        elif a.command == "sync":
+            r = sync_index(c, collect_memory_roots(settings, sp))
         elif a.command in {"search", "list"}:
             project = _query_project(settings, a.project, a.path)
             r = (

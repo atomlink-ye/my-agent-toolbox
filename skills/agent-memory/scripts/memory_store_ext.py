@@ -9,6 +9,15 @@ from memory_config import MemoryError, MemoryRoot
 
 MEMORY_ID_RE = re.compile(r"^mem_[A-Za-z0-9_-]+$")
 LIFECYCLE_STATES = {"raw", "validated", "promoted", "superseded"}
+REQUIRED_SCHEMA = {
+    "documents",
+    "document_scopes",
+    "document_tags",
+    "links",
+    "document_fts",
+    "memory_meta",
+    "memory_links",
+}
 MEM_LINK_RE = re.compile(
     r"(?<!!)\[([^\]]*)\]\(memory://(mem_[A-Za-z0-9_-]+)(?:#([^)]+))?\)"
 )
@@ -21,6 +30,70 @@ def connect_db(path: Path) -> sqlite3.Connection:
     )
     c.commit()
     return c
+
+
+def connect_db_readonly(path: Path) -> tuple[sqlite3.Connection, bool]:
+    """Open an initialized index without creating schema or journal sidecars.
+
+    A WAL-mode database normally needs a writable ``-shm`` file even for a
+    read-only connection.  Prefer normal read-only locking so concurrent WAL
+    writers remain visible, then fall back to an immutable view only when the
+    database has no uncheckpointed WAL content.
+    """
+    path = path.expanduser().resolve(strict=False)
+    if not path.is_file():
+        raise MemoryError("index not initialized, run: agent-memory sync")
+
+    def open_uri(*, immutable: bool) -> sqlite3.Connection:
+        suffix = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+        conn = sqlite3.connect(f"{path.as_uri()}{suffix}", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA query_only=ON")
+            # Force SQLite to open the WAL/shared-memory state now, so the caller
+            # does not receive a delayed 'unable to open database file' error.
+            conn.execute("PRAGMA schema_version").fetchone()
+            return conn
+        except Exception:
+            conn.close()
+            raise
+
+    used_immutable = False
+    try:
+        conn = open_uri(immutable=False)
+    except sqlite3.OperationalError as error:
+        if "unable to open database file" not in str(error).casefold():
+            raise
+        wal_path = Path(f"{path}-wal")
+        if wal_path.is_file() and wal_path.stat().st_size > 0:
+            raise MemoryError(
+                "read-only index has uncheckpointed WAL data; "
+                "run: agent-memory sync in a writable environment"
+            ) from error
+        conn = open_uri(immutable=True)
+        if wal_path.is_file() and wal_path.stat().st_size > 0:
+            conn.close()
+            raise MemoryError(
+                "read-only index changed while opening; "
+                "retry or run: agent-memory sync in a writable environment"
+            ) from error
+        used_immutable = True
+
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+            )
+        }
+    except Exception:
+        conn.close()
+        raise
+    if not REQUIRED_SCHEMA.issubset(tables):
+        conn.close()
+        raise MemoryError("index not initialized, run: agent-memory sync")
+    return conn, used_immutable
 
 
 def _meta(path: Path):
