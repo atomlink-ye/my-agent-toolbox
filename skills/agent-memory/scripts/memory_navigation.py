@@ -1,0 +1,119 @@
+"""Small, truthful SQLite inventories for memory navigation."""
+
+from __future__ import annotations
+
+import sqlite3
+from typing import Any, Iterable
+
+from memory_config import SHARED_SCOPE, _normalize_tag
+
+
+def _tag_predicates(tags: tuple[str, ...], alias: str = "d") -> tuple[str, list[Any]]:
+    sql = ""
+    params: list[Any] = []
+    for raw_tag in tags:
+        segments = _normalize_tag(raw_tag).split(":")
+        tests = [
+            "instr(':' || lower(tf.tag) || ':', ':' || lower(?) || ':') > 0"
+            for _ in segments
+        ]
+        sql += (
+            f" AND EXISTS (SELECT 1 FROM document_tags tf WHERE tf.document_id={alias}.id AND "
+            + " AND ".join(tests)
+            + ")"
+        )
+        params.extend(segments)
+    return sql, params
+
+
+def _scope_clause(project: str | None, include_shared: bool) -> tuple[str, list[Any]]:
+    scopes = ([project] if project else []) + ([SHARED_SCOPE] if include_shared else [])
+    if not scopes:
+        return " AND 0", []
+    marks = ",".join("?" for _ in scopes)
+    return (
+        " AND EXISTS (SELECT 1 FROM document_scopes sv "
+        f"WHERE sv.document_id=d.id AND sv.scope IN ({marks}))",
+        scopes,
+    )
+
+
+def _count(conn: sqlite3.Connection, scope: str, tags: tuple[str, ...]) -> int:
+    tag_sql, tag_params = _tag_predicates(tags)
+    row = conn.execute(
+        "SELECT count(DISTINCT d.id) FROM documents d "
+        "WHERE EXISTS (SELECT 1 FROM document_scopes s "
+        "WHERE s.document_id=d.id AND s.scope=?)" + tag_sql,
+        [scope, *tag_params],
+    ).fetchone()
+    return int(row[0])
+
+
+def _sample(
+    conn: sqlite3.Connection, scope: str, tags: tuple[str, ...], limit: int
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    tag_sql, tag_params = _tag_predicates(tags)
+    rows = conn.execute(
+        "SELECT d.id,d.title,d.path FROM documents d "
+        "WHERE EXISTS (SELECT 1 FROM document_scopes s "
+        "WHERE s.document_id=d.id AND s.scope=?)" + tag_sql
+        + " ORDER BY d.mtime_ns DESC,d.path LIMIT ?",
+        [scope, *tag_params, limit],
+    )
+    return [
+        {"id": int(row["id"]), "title": row["title"], "path": row["path"], "scope": scope}
+        for row in rows
+    ]
+
+
+def navigation_inventory(
+    conn: sqlite3.Connection,
+    *,
+    project: str | None,
+    tags: Iterable[str] = (),
+    include_shared: bool = True,
+    global_limit: int = 2,
+    project_limit: int = 4,
+    tag_limit: int = 5,
+) -> dict[str, Any]:
+    """Return independently counted scope components plus a bounded index."""
+    tags = tuple(tags)
+    visible_sql, visible_params = _scope_clause(project, include_shared)
+    tag_sql, tag_params = _tag_predicates(tags)
+    visible = int(
+        conn.execute(
+            "SELECT count(DISTINCT d.id) FROM documents d WHERE 1=1"
+            + visible_sql
+            + tag_sql,
+            [*visible_params, *tag_params],
+        ).fetchone()[0]
+    )
+    global_count = _count(conn, SHARED_SCOPE, tags) if include_shared else 0
+    project_count = _count(conn, project, tags) if project is not None else None
+
+    tag_rows = conn.execute(
+        "SELECT t.tag,count(DISTINCT t.document_id) AS count "
+        "FROM document_tags t JOIN documents d ON d.id=t.document_id WHERE 1=1"
+        + visible_sql
+        + tag_sql
+        + " GROUP BY t.tag ORDER BY count DESC,lower(t.tag),t.tag LIMIT ?",
+        [*visible_params, *tag_params, max(0, tag_limit)],
+    )
+    top_tags = [{"tag": row["tag"], "count": int(row["count"])} for row in tag_rows]
+    global_rows = _sample(conn, SHARED_SCOPE, tags, global_limit) if include_shared else []
+    project_rows = _sample(conn, project, tags, project_limit) if project else []
+    shown = {row["id"] for row in [*global_rows, *project_rows]}
+    return {
+        "counts": {
+            "distinct": visible,
+            "global": global_count,
+            "project": project_count,
+            "components_overlap": True,
+        },
+        "tags": top_tags,
+        "global": global_rows,
+        "project": project_rows,
+        "omitted": max(0, visible - len(shown)),
+    }

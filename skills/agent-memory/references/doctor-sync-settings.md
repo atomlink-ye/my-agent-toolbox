@@ -102,6 +102,11 @@ The portable entrypoint is `python3
 gain an `agent-memory` command merely by being discovered; command lookup and the Python
 fallback in `SKILL.md` cover both cases without guessing from CWD.
 
+After setup or repair, begin consumption with an unparameterized `brief`. Repeat it after
+switching projects or when context compression has made the prior scope/index map
+unavailable. A task-specific `--path` belongs on later targeted routing commands; adding
+one to the opening brief defeats its role as a report of the runtime's real current scope.
+
 ## Known mechanism caveats
 
 - Read commands use a read-only SQLite connection and do not run schema-creating DDL. On a

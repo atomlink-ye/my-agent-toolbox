@@ -14,6 +14,43 @@ project-local capture workflow) therefore creates two failure modes:
 The desired system is not a conversation-memory engine. It is a small local registry that
 answers: *which durable files are relevant, where are they, and how are they related?*
 
+## Agent consumption protocol
+
+The daily loop is **brief-first**. At task start, run one unparameterized command:
+
+```bash
+"${AM[@]}" --json brief
+```
+
+It reports the actual visible scope, document count, index state, tags, topic hooks, and
+navigation. Read any relevant topic path with the agent's normal file Read operation;
+routes and search rows are not the source content. Do not start by guessing broad terms
+such as `conventions`.
+
+When the first map is too compact, expand it in the same scope:
+
+```bash
+"${AM[@]}" --json context
+```
+
+Reserve search for concrete evidence:
+
+```bash
+"${AM[@]}" --json search "<specific evidence>" --path /abs/path/to/project
+```
+
+A zero-result search means that query has no match; it is not proof that the visible
+scope has no memory. Read its navigation, counts, and tags, then run the single most
+relevant next command. If the brief, expanded context/index, and one evidence-based
+alternative query still expose no relevant topic, report that no relevant memory was
+found in the currently visible scope and continue the task. This is a bounded recovery
+rule, not an invitation to search indefinitely.
+
+Repeat the unparameterized brief after switching projects, or after context compression
+when the earlier scope/index map is no longer available. Natural-language instructions
+can be checked for presence and exercised in evaluation fixtures, but those static checks
+do not prove that an agent will follow them in a real session.
+
 ## MVE goals
 
 - Markdown files remain the source of truth and stay directly editable by humans/agents.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, sqlite3, sys
+import argparse, json, shlex, sqlite3, sys
 from pathlib import Path
 from memory_admin import preferred_capture_root, project_inventory, tag_inventory
 from memory_doctor_ext import doctor
@@ -19,7 +19,16 @@ from memory_config import (
     resolve_project_binding,
     shared_roots,
 )
-from memory_format import compact_dump, table_dump, yaml_dump
+from memory_context import resolve_context
+from memory_format import (
+    OUTPUT_BUDGET,
+    bounded_json,
+    bounded_navigation_text,
+    compact_dump,
+    table_dump,
+    yaml_dump,
+)
+from memory_navigation import navigation_inventory
 from memory_lifecycle import update_lifecycle
 from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 from memory_store_ext import (
@@ -41,6 +50,8 @@ READ_ONLY_DB_COMMANDS = {
     "projects",
     "tags",
     "browse",
+    "brief",
+    "context",
 }
 
 
@@ -73,9 +84,9 @@ def _database_error_message(error: Exception, db: Path | None) -> str:
     )
 
 
-def _readonly_connection(db: Path):
+def _readonly_connection(db: Path, warn: bool = True):
     connection, used_immutable = connect_db_readonly(db)
-    if used_immutable:
+    if used_immutable and warn:
         print(
             "agent-memory: warning: read-only WAL access unavailable; "
             "using an immutable index view",
@@ -217,6 +228,14 @@ def _opts(p):
         const="yaml",
         default=argparse.SUPPRESS,
     )
+    g.add_argument(
+        "--envelope",
+        dest="output_format",
+        action="store_const",
+        const="envelope",
+        default=argparse.SUPPRESS,
+        help="emit one structured search response object",
+    )
 
 
 def build_parser():
@@ -298,6 +317,14 @@ def build_parser():
     q.add_argument("--tag", action="append", default=[])
     q.add_argument("--limit", type=int, default=100)
     q.add_argument("--no-shared", action="store_true")
+    q = sub("brief", "show a bounded opening inventory for the current project")
+    q.add_argument("--path", type=Path)
+    q = sub("context", "expand the bounded project memory inventory")
+    target = q.add_mutually_exclusive_group()
+    target.add_argument("--path", type=Path)
+    target.add_argument("--project")
+    q.add_argument("--tag", action="append", default=[])
+    q.add_argument("--no-shared", action="store_true")
     q = sub("doctor", "health diagnostics")
     q.add_argument("--path", type=Path)
     return p
@@ -363,14 +390,103 @@ def _browse_documents(conn, project=None, tags=(), limit=100, include_shared=Tru
     }
 
 
+def _scope_command(command, context, tags=(), include_shared=True):
+    project = context.get("project")
+    parts = ["agent-memory", command]
+    if project:
+        parts.extend(["--project", project])
+    elif context.get("path"):
+        parts.extend(["--path", context["path"]])
+    for tag in tags:
+        parts.extend(["--tag", tag])
+    if not include_shared:
+        parts.append("--no-shared")
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _navigation_payload(
+    conn,
+    context,
+    *,
+    status_name,
+    tags=(),
+    include_shared=True,
+    global_limit=2,
+    project_limit=4,
+    tag_limit=5,
+    query=None,
+):
+    registered = context["status"] == "resolved"
+    inventory = navigation_inventory(
+        conn,
+        project=context["project"] if registered else None,
+        tags=tags,
+        include_shared=include_shared,
+        global_limit=global_limit,
+        project_limit=project_limit,
+        tag_limit=tag_limit,
+    )
+    state = status_name
+    if not registered and status_name != "no_match":
+        state = "unregistered"
+    elif inventory["counts"]["distinct"] == 0 and status_name != "no_match":
+        state = "empty"
+    navigation = [*inventory["global"], *inventory["project"]]
+    next_command = _scope_command("context", context, tags, include_shared)
+    if tags:
+        next_command = _scope_command("list", context, tags, include_shared) + " --limit 5"
+    return {
+        "status": state,
+        "project": context.get("project"),
+        "source": context.get("source", "unknown"),
+        "query": query,
+        "match_mode": "none" if query is not None else None,
+        "scope": {
+            "project": context.get("project"),
+            "source": context.get("source", "unknown"),
+            "include_global": include_shared,
+            "tags": list(tags),
+            "resolution_status": context.get("status", "unknown"),
+        },
+        "counts": inventory["counts"],
+        "tags": inventory["tags"] if registered else [],
+        "navigation": navigation if registered else inventory["global"],
+        "configured_projects": context.get("configured_projects", []),
+        "omitted": inventory["omitted"],
+        "next_commands": [next_command if registered else "agent-memory projects"],
+        "truncated": False,
+    }
+
+
+def _emit_bounded_payload(payload, fmt, budget=OUTPUT_BUDGET):
+    if fmt in {"json", "envelope"}:
+        print(bounded_json(payload, budget), end="")
+    else:
+        print(bounded_navigation_text(payload, budget), end="")
+
+
+def _empty_result_text(fmt):
+    if fmt == "json":
+        return "[]\n"
+    if fmt == "compact":
+        return "(no results)\n"
+    if fmt == "yaml":
+        return "[]\n"
+    if fmt == "table":
+        return table_dump("search", []) + "\n"
+    return ""
+
+
 def main(argv=None):
     p = build_parser()
     raw = sys.argv[1:] if argv is None else argv
-    if len({x for x in raw if x in {"--compact", "--json", "--table", "--text", "--yaml"}}) > 1:
+    if len({x for x in raw if x in {"--compact", "--json", "--table", "--text", "--yaml", "--envelope"}}) > 1:
         p.error("output options are mutually exclusive")
     a = p.parse_args(raw)
     if a.output_format == "compact" and a.command not in {"search", "list"}:
         p.error("--compact is only available for search and list")
+    if a.output_format == "envelope" and a.command not in {"search", "brief", "context"}:
+        p.error("--envelope is only available for search, brief, and context")
     if a.verbose and a.output_format not in {None, "json"}:
         p.error("--verbose may only be used with --json")
     a.output_format = a.output_format or (
@@ -379,7 +495,7 @@ def main(argv=None):
         else "compact"
         if a.command in {"search", "list"}
         else "text"
-        if a.command == "browse"
+        if a.command in {"browse", "brief", "context"}
         else "yaml"
     )
     sp = a.settings.expanduser().resolve(strict=False)
@@ -450,7 +566,7 @@ def main(argv=None):
     try:
         settings = load_settings(sp)
         db = database_path(settings, sp)
-        if a.command in {"search", "list", "tags", "browse"}:
+        if a.command in {"search", "list", "tags", "browse", "brief", "context"}:
             # Validate all routing config before a query opens/initializes SQLite.
             flatten_bindings(settings)
             shared_roots(settings, sp)
@@ -480,7 +596,7 @@ def main(argv=None):
             _emit(r, a.command, a.output_format, a.verbose)
             return 0
         c = (
-            _readonly_connection(db)
+            _readonly_connection(db, warn=a.command not in {"brief", "context"})
             if a.command in READ_ONLY_DB_COMMANDS
             else connect_db(db)
         )
@@ -532,16 +648,123 @@ def main(argv=None):
         elif a.command == "browse":
             project = _query_project(settings, a.project, a.path)
             r = _browse_documents(c, project, a.tag, a.limit, not a.no_shared)
+        elif a.command in {"brief", "context"}:
+            context = resolve_context(
+                settings,
+                path=a.path,
+                project=getattr(a, "project", None),
+            )
+            r = _navigation_payload(
+                c,
+                context,
+                status_name="ok",
+                tags=tuple(getattr(a, "tag", ())),
+                include_shared=not getattr(a, "no_shared", False),
+                global_limit=2 if a.command == "brief" else 5,
+                project_limit=4 if a.command == "brief" else 15,
+                tag_limit=5 if a.command == "brief" else 10,
+            )
+            _emit_bounded_payload(r, a.output_format)
+            c.close()
+            return 0
         roots = (
             [root.path for root in collect_memory_roots(settings, sp)]
             if a.command in {"search", "list"}
             else ()
         )
-        _emit(r, a.command, a.output_format, a.verbose, roots)
+        if a.command == "search" and a.output_format == "envelope":
+            context = (
+                resolve_context(settings, path=a.path, project=a.project)
+                if a.path is not None or a.project is not None
+                else resolve_context(settings)
+                if not r
+                else {
+                    "status": "resolved",
+                    "project": None,
+                    "source": "all",
+                    "path": None,
+                    "configured_projects": [],
+                }
+            )
+            packet = _navigation_payload(
+                c,
+                context,
+                status_name="no_match" if not r else "ok",
+                tags=tuple(a.tag),
+                include_shared=not a.no_shared,
+                query=a.query,
+            )
+            packet.update(
+                {
+                    "schema_version": 1,
+                    "results": r,
+                    "navigation": packet["navigation"] if not r else [],
+                    "status": "no_match" if not r else "ok",
+                }
+            )
+            if r:
+                print(json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
+            else:
+                _emit_bounded_payload(packet, "envelope")
+        elif a.command == "search" and not r:
+            stdout = _empty_result_text(a.output_format)
+            print(stdout, end="")
+            context = (
+                resolve_context(settings, path=a.path, project=a.project)
+                if a.path is not None or a.project is not None
+                else resolve_context(settings)
+            )
+            packet = _navigation_payload(
+                c,
+                context,
+                status_name="no_match",
+                tags=tuple(a.tag),
+                include_shared=not a.no_shared,
+                query=a.query,
+            )
+            remaining = max(256, OUTPUT_BUDGET - len(stdout.encode("utf-8")))
+            print(bounded_navigation_text(packet, remaining), end="", file=sys.stderr)
+        else:
+            _emit(r, a.command, a.output_format, a.verbose, roots)
         c.close()
         return 0
     except (MemoryError, OSError, sqlite3.Error) as e:
-        print(f"agent-memory: {_database_error_message(e, db)}", file=sys.stderr)
+        message = _database_error_message(e, db)
+        if a.command in {"brief", "context", "search"}:
+            unavailable = {
+                "schema_version": 1,
+                "status": "unavailable",
+                "project": None,
+                "source": "unknown",
+                "query": getattr(a, "query", None),
+                "match_mode": None,
+                "scope": {
+                    "project": None,
+                    "source": "unknown",
+                    "include_global": not getattr(a, "no_shared", False),
+                    "tags": list(getattr(a, "tag", ())),
+                },
+                "counts": {
+                    "distinct": "unknown",
+                    "global": "unknown",
+                    "project": "unknown",
+                    "components_overlap": True,
+                },
+                "results": [],
+                "tags": [],
+                "navigation": [],
+                "configured_projects": [],
+                "omitted": "unknown",
+                "diagnostic": message,
+                "next_commands": ["agent-memory doctor"],
+                "truncated": False,
+            }
+            if a.output_format == "envelope":
+                print(bounded_json(unavailable), end="")
+            else:
+                print(bounded_navigation_text(unavailable), end="", file=sys.stderr)
+        else:
+            print(f"agent-memory: {message}", file=sys.stderr)
         return 2
 
 

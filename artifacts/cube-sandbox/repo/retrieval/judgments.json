@@ -1,0 +1,282 @@
+[
+  {
+    "id": "cjk-01",
+    "category": "cjk",
+    "query": "本地编辑与远端开发",
+    "expected_path": "agent-server/QA-LEARNING-REMOTE-DEVELOPMENT.md",
+    "rationale": "The title and brief describe local editing and remote Sandbox development in Chinese."
+  },
+  {
+    "id": "cjk-02",
+    "category": "cjk",
+    "query": "数据面可用",
+    "expected_path": "agent-server/QA-LEARNING-REMOTE-DEVELOPMENT.md",
+    "rationale": "The Sandbox binding section says running state does not prove that the data plane is usable."
+  },
+  {
+    "id": "cjk-03",
+    "category": "cjk",
+    "query": "验收脚手架报废",
+    "expected_path": "agent-server/drawbacks/20260821-091959-105-764.md",
+    "rationale": "The title states that acceptance scaffolding was repeatedly discarded."
+  },
+  {
+    "id": "mixed-01",
+    "category": "mixed-language",
+    "query": "sandbox 凭据 故障恢复",
+    "expected_path": "agent-server/QA-LEARNING-REMOTE-DEVELOPMENT.md",
+    "rationale": "The brief explicitly presents one entry point for Sandbox credentials and failure recovery."
+  },
+  {
+    "id": "mixed-02",
+    "category": "mixed-language",
+    "query": "pnpm link 全局 CLI 劫持",
+    "expected_path": "agent-server/drawbacks/20260820-131351-pnpm-link-global-worktree-cli.md",
+    "rationale": "The title says a temporary worktree can silently hijack the global CLI through pnpm link."
+  },
+  {
+    "id": "mixed-03",
+    "category": "mixed-language",
+    "query": "preflight 就绪闸门 长跑验证",
+    "expected_path": "agent-server/learnings/20260820-140036-preflight-10-0.md",
+    "rationale": "The document recommends a preflight readiness gate before long remote verification."
+  },
+  {
+    "id": "synonym-01",
+    "category": "paraphrase",
+    "query": "sandbox cannot connect",
+    "expected_path": "arcp/errors/20260908-stale-binding-silently-swallows-a-write-command.md",
+    "rationale": "The document explains a stale Cube binding whose control connection is unavailable."
+  },
+  {
+    "id": "synonym-02",
+    "category": "paraphrase",
+    "query": "expired sandbox connection command never arrived",
+    "expected_path": "arcp/errors/20260908-stale-binding-silently-swallows-a-write-command.md",
+    "rationale": "The body says the binding expired and the write command never reached the sandbox."
+  },
+  {
+    "id": "synonym-03",
+    "category": "paraphrase",
+    "query": "container disk full",
+    "expected_path": "agent-server/errors/20260820-161100-docker-buildkit-enospc-can-come-from-dockerrootdir-loop-disk-not.md",
+    "rationale": "The document diagnoses Docker BuildKit ENOSPC on the DockerRootDir loop disk."
+  },
+  {
+    "id": "natural-01",
+    "category": "long-natural-language",
+    "query": "why does the sandbox look alive even though commands cannot connect to it",
+    "expected_path": "arcp/drawbacks/20260908-cluster-and-adopt-disagree-about-liveness.md",
+    "rationale": "The document contrasts a running cluster state with a dead/unusable local control channel."
+  },
+  {
+    "id": "natural-02",
+    "category": "long-natural-language",
+    "query": "how should I recover a sandbox exec after the local command times out",
+    "expected_path": "agent-server/learnings/20260825-015616-sandbox-ctl-exec-recovery-classify-control-failures-and-use-exec.md",
+    "rationale": "The document says to classify control failures and retrieve status/result by executionId after a timeout."
+  },
+  {
+    "id": "natural-03",
+    "category": "long-natural-language",
+    "query": "the web page returns 200 but the typescript entry module fails with 500",
+    "expected_path": "agent-server/errors/20260820-154843-web-vite-get-is-200-while-src-main-tsx-is-500-dockerfile-omits-a.md",
+    "rationale": "The title records GET / succeeding while /src/main.tsx returns 500."
+  },
+  {
+    "id": "natural-04",
+    "category": "long-natural-language",
+    "query": "a second unattended server starts but performs no work because another process owns the lease",
+    "expected_path": "arcp/drawbacks/20260906-062000-second-serve-silently-noops-while-first-holds-lease.md",
+    "rationale": "The title and body describe a second serve process silently no-oping while the first holds the runner lease."
+  },
+  {
+    "id": "rare-01",
+    "category": "identifier",
+    "query": "AGENT_CREATE_FAILED",
+    "expected_path": "arcp/errors/20260902-042857-long-arcp-goals-exceed-paseo-tab-title-limit.md",
+    "rationale": "The body names this exact failure code for overlong Paseo tab titles."
+  },
+  {
+    "id": "rare-02",
+    "category": "identifier",
+    "query": "PASEO_MATCHES",
+    "expected_path": "agent-server/drawbacks/20260820-144851-paseo-matches-empty-prevents-h1-h2-classification-after-t-203s-w.md",
+    "rationale": "The exact environment variable appears in the title and describes the empty-match failure."
+  },
+  {
+    "id": "rare-03",
+    "category": "identifier",
+    "query": "hasLiveWakeupSource",
+    "expected_path": "agent-server/drawbacks/20260820-160416-haslivewakeupsource-excludes-reminders-it-is-paseo-wait-or-compa.md",
+    "rationale": "The exact function name occurs in the title."
+  },
+  {
+    "id": "rare-04",
+    "category": "identifier",
+    "query": "SERVICE_ACCOUNTS_JSON",
+    "expected_path": "agent-server/errors/20260821-051553-shell-source-strips-the-double-quotes-from-service-accounts-json.md",
+    "rationale": "The exact variable occurs in the title and the document explains its invalid JSON value."
+  },
+  {
+    "id": "rare-05",
+    "category": "identifier",
+    "query": "lineageId",
+    "expected_path": "arcp/learnings/20260903-021003-sequence-anomaly-detectors-must-join-runtime-lifecycle-evidence-.md",
+    "rationale": "The title says anomaly evidence must join on durable lineageId."
+  },
+  {
+    "id": "rare-06",
+    "category": "identifier",
+    "query": "executionId",
+    "expected_path": "agent-server/learnings/20260825-015616-sandbox-ctl-exec-recovery-classify-control-failures-and-use-exec.md",
+    "rationale": "The exact identifier occurs in the title and recovery instructions."
+  },
+  {
+    "id": "hyphen-01",
+    "category": "morphology-punctuation",
+    "query": "readonly lookup",
+    "expected_path": "arcp/learnings/20260909-authorization-axis-closed-by-census.md",
+    "rationale": "The body classifies resolve_document_reference as a read-only lookup."
+  },
+  {
+    "id": "hyphen-02",
+    "category": "morphology-punctuation",
+    "query": "read-only lookup",
+    "expected_path": "arcp/learnings/20260909-authorization-axis-closed-by-census.md",
+    "rationale": "This uses the spelling present in the document for the same information need as hyphen-01."
+  },
+  {
+    "id": "morph-01",
+    "category": "morphology-punctuation",
+    "query": "reminder wakeup sources",
+    "expected_path": "agent-server/drawbacks/20260820-160416-haslivewakeupsource-excludes-reminders-it-is-paseo-wait-or-compa.md",
+    "rationale": "The title uses singular source and reminder-only while the query deliberately uses plural forms."
+  },
+  {
+    "id": "morph-02",
+    "category": "morphology-punctuation",
+    "query": "callbacks deliver submissions task fence",
+    "expected_path": "arcp/learnings/20260906-001616-callback-delivery-must-resolve-submissions-by-task-and-fence.md",
+    "rationale": "The title uses callback delivery and submission, testing inflection changes."
+  },
+  {
+    "id": "exact-01",
+    "category": "lexical-control",
+    "query": "references-only tsconfig",
+    "expected_path": "agent-server/drawbacks/20260907-053204-frontend-typecheck-entrypoint-uses-a-references-only-tsconfig.md",
+    "rationale": "Both distinctive terms occur verbatim in the title."
+  },
+  {
+    "id": "exact-02",
+    "category": "lexical-control",
+    "query": "orphan pending WorkRun",
+    "expected_path": "agent-server/drawbacks/20260826-071959-aborted-startworkrun-admission-leaves-a-visible-orphan-pending-w.md",
+    "rationale": "All three terms occur together in the title."
+  },
+  {
+    "id": "exact-03",
+    "category": "lexical-control",
+    "query": "post-parse normalization option-order",
+    "expected_path": "arcp/learnings/20260906-044113-cli-aliases-that-coexist-with-legacy-positionals-need-post-parse.md",
+    "rationale": "Both hyphenated phrases occur in the title."
+  },
+  {
+    "id": "exact-04",
+    "category": "lexical-control",
+    "query": "immutable runtime provenance",
+    "expected_path": "arcp/learnings/20260902-221853-managed-result-submission-must-fail-closed-on-immutable-runtime-.md",
+    "rationale": "The phrase occurs verbatim in the title."
+  },
+  {
+    "id": "exact-05",
+    "category": "lexical-control",
+    "query": "indexed schedule timestamps SQLite ordering",
+    "expected_path": "arcp/learnings/20260904-021030-normalize-indexed-schedule-timestamps-before-sqlite-ordering.md",
+    "rationale": "These distinctive title terms identify the timestamp normalization note."
+  },
+  {
+    "id": "exact-06",
+    "category": "lexical-control",
+    "query": "fixed-string grep structured output",
+    "expected_path": "agent-server/errors/20260821-011311-fixed-string-grep-against-structured-output-is-a-recurring-defec.md",
+    "rationale": "The phrase occurs verbatim in the title."
+  },
+  {
+    "id": "exact-07",
+    "category": "lexical-control",
+    "query": "runtime idleness safe point Channel",
+    "expected_path": "arcp/learnings/20260902-144727-arcp-runtime-idleness-is-only-a-safe-point-never-proof-of-channe.md",
+    "rationale": "The title contains all four distinctive terms."
+  },
+  {
+    "id": "exact-08",
+    "category": "lexical-control",
+    "query": "complete receipt contract routing",
+    "expected_path": "arcp/learnings/20260902-142930-arcp-routing-changes-require-a-complete-receipt-contract-before-.md",
+    "rationale": "The title says routing changes require a complete receipt contract."
+  },
+  {
+    "id": "exact-09",
+    "category": "lexical-control",
+    "query": "semantic preflight extension resolution",
+    "expected_path": "agent-server/learnings/20260915-052807-workdefinition-semantic-preflight-must-share-extension-resolutio.md",
+    "rationale": "The title contains this exact concept pair."
+  },
+  {
+    "id": "exact-10",
+    "category": "lexical-control",
+    "query": "provider activity material progress",
+    "expected_path": "arcp/learnings/20260906-043609-arcp-supervision-must-keep-provider-activity-separate-from-mater.md",
+    "rationale": "The title explicitly contrasts provider activity with material progress."
+  },
+  {
+    "id": "exact-11",
+    "category": "lexical-control",
+    "query": "shell expands backticks paseo send",
+    "expected_path": "agent-server/errors/20260825-101416-shell-expands-backticks-inside-double-quoted-paseo-send-prompts.md",
+    "rationale": "The title contains these exact distinctive terms."
+  },
+  {
+    "id": "exact-12",
+    "category": "lexical-control",
+    "query": "cherry-pick provenance mainline commits",
+    "expected_path": "arcp/learnings/20260904-190107-cherry-pick-provenance-can-omit-required-mainline-commits-even-w.md",
+    "rationale": "The title says cherry-pick provenance can omit required mainline commits."
+  },
+  {
+    "id": "rank-01",
+    "category": "ranking",
+    "query": "BuildKit",
+    "expected_path": "agent-server/errors/20260820-144737-dockerfile-web-testing-requires-buildkit.md",
+    "rationale": "This is the shortest dedicated BuildKit prerequisite note, tested against several longer BuildKit documents."
+  },
+  {
+    "id": "rank-02",
+    "category": "ranking",
+    "query": "defaultMode",
+    "expected_path": "arcp/learnings/20260904-220003-paseo-defaultmode-is-not-a-launchable-mode-when-modes-is-empty.md",
+    "rationale": "This is the direct note that defaultMode is not launchable, amid multiple documents mentioning it."
+  },
+  {
+    "id": "rank-03",
+    "category": "ranking",
+    "query": "sandbox_stale_connection",
+    "expected_path": "arcp/errors/20260908-stale-binding-silently-swallows-a-write-command.md",
+    "rationale": "The document directly explains this error kind and whether the write occurred."
+  },
+  {
+    "id": "rank-04",
+    "category": "ranking",
+    "query": "CJK tokenization",
+    "expected_path": "agent-server/drawbacks/20260820-140411-agent-memory-fts-cjk-indexed-as-whole-punctuation-delimited-runs.md",
+    "rationale": "The document is specifically about Agent Memory CJK tokenization behavior."
+  },
+  {
+    "id": "rank-05",
+    "category": "ranking",
+    "query": "PGlite positive proofs novelty spawned-child",
+    "expected_path": "agent-server/learnings/20260828-112653-fixture-pglite-positive-proofs-need-both-novelty-and-spawned-chi.md",
+    "rationale": "The full distinctive phrase identifies the PGlite fixture proof note."
+  }
+]

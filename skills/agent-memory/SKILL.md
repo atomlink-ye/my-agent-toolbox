@@ -68,13 +68,54 @@ That substitution has not been end-to-end verified in this repository's test env
 It is not a normal Bash environment variable and must not be used by Codex, a standalone
 skill copy, or a bare terminal.
 
-## Recall before starting non-trivial work
+## Daily consumption loop: brief, read, then narrow
+
+At the start of a task, run one **unparameterized** `brief`. Do this before inventing a
+query such as `conventions`, `setup`, or `best practices`:
 
 ```bash
-"${AM[@]}" search "<query>" --path /abs/path/to/project
+"${AM[@]}" --json brief
 ```
 
-- Run this before non-trivial work, or whenever asking "have we seen this before?"
+The brief is the map of the current visible scope. Check its resolved scope, document
+count, index state, tags, topic hooks, and navigation. For each hook that is relevant to
+the task, use the agent's ordinary file-reading tool to read the routed Markdown topic.
+The CLI output is routing metadata, not the memory content and not a substitute for
+reading the source file.
+
+If the brief does not expose enough routes, expand the same visible scope:
+
+```bash
+"${AM[@]}" --json context
+```
+
+Use a targeted search only when the task supplies a concrete term, identifier, error, or
+other evidence worth locating:
+
+```bash
+"${AM[@]}" --json search "<specific evidence>" --path /abs/path/to/project
+```
+
+`search`, `context`, and `brief` route to authoritative Markdown. Read the returned topic
+paths with the ordinary Read tool before applying their guidance. For search/list compact
+output, join the printed memory-root base and relative path.
+
+One zero match means only that **this query** did not match. It is not evidence that the
+visible scope contains no memory. Inspect the returned navigation, document count, and
+tags, then execute the single most relevant next command. Do not summarize `no_match` as
+"there is no memory."
+
+After the brief, expanded index/context, and one evidence-based alternative query have
+all failed to route to a relevant topic, state: "No relevant memory was found in the
+currently visible scope." Then continue the user's task without memory; do not keep
+searching or manufacture more synonyms.
+
+Run another unparameterized `brief` when the active project changes, or after context
+compression when the earlier index/scope is no longer visible. Do not repeat it on every
+turn while the same map remains available.
+
+### Routing output details
+
 - `search` and `list` default to the compact routing format. Each result contains a title,
   an optional non-duplicate brief, and a path relative to the printed memory-root base.
   Join the base and relative path, then **read that Markdown file**. Search output is a
@@ -86,8 +127,9 @@ skill copy, or a bare terminal.
   diagnostics, use `--json --verbose` (or bare `--verbose`) to get the complete,
   pretty-printed record including match mode, scores, and matched/missing terms.
 - `--path` is worth passing but not worth over-engineering here: an unbound or wrong
-  path silently falls back to a global search rather than failing. If a query genuinely
-  returns nothing, retry with fewer/looser terms before concluding it doesn't exist.
+  path can broaden a read to global scope. Confirm the reported scope before using a
+  route. A zero match follows the bounded recovery rule above, not an unbounded synonym
+  loop.
 - Never chain `doctor && search`: `doctor` uses `0=ok`, `1=warnings`, and `2=errors`, so
   `&&` skips search for both warning and error. Warnings can be actionable (for example,
   stale/unindexed Markdown or a missing root); inspect them, but run an intended search as

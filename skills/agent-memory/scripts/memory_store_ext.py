@@ -210,6 +210,24 @@ def list_documents(c, project=None, tags=(), limit=100, include_shared=True):
     ]
 
 
+def enumerate_sources(context):
+    return base.enumerate_sources(context)
+
+
+def navigation_inventory(context, filters=None):
+    result = base.navigation_inventory(context, filters)
+    connection = (
+        context.get("connection", context.get("conn"))
+        if isinstance(context, dict)
+        else getattr(context, "connection", getattr(context, "conn", None))
+    )
+    if connection is not None:
+        result["route_candidates"] = [
+            _enrich(connection, item) for item in result["route_candidates"]
+        ]
+    return result
+
+
 def resolve_document(c, ref):
     raw = ref[9:].split("#", 1)[0] if ref.startswith("memory://") else ref
     if raw.startswith("mem_"):

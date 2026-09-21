@@ -28,6 +28,14 @@ from memory_config import (
 MD_LINK_RE = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)]+)\)")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]")
 
+# Generated indexes and recovery copies are navigation infrastructure, not memory
+# topics.  Keep this list exact so a legitimate note such as backup-strategy.md is
+# still indexed.
+MANAGEMENT_DIRECTORY_NAMES = frozenset(
+    {".cache", ".backup", "cache", "caches", "context-cache", "backup", "backups"}
+)
+MANAGEMENT_FILE_NAMES = frozenset({"memory.md"})
+
 # Deliberately small and conventional: these words add little discrimination to a
 # natural-language OR fallback.  This is only consulted after the unchanged AND
 # route is empty, and only plain alphabetic words are eligible.
@@ -300,6 +308,119 @@ def _extract_links(source: Path, body: str) -> list[dict[str, str | None]]:
     return list(unique.values())
 
 
+def _is_memory_source(path: Path, root: Path) -> bool:
+    """Return whether a Markdown path is a user memory rather than an artifact."""
+    folded_stem = path.stem.casefold()
+    if (
+        path.suffix.casefold() != ".md"
+        or path.name.casefold() in MANAGEMENT_FILE_NAMES
+        or folded_stem.endswith((".bak", ".backup"))
+        or folded_stem.endswith("~")
+        or root.name.casefold() in MANAGEMENT_DIRECTORY_NAMES
+    ):
+        return False
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    return not any(
+        part.casefold() in MANAGEMENT_DIRECTORY_NAMES for part in relative.parts[:-1]
+    )
+
+
+def _iter_memory_sources(root: Path) -> Iterable[Path]:
+    for path in root.rglob("*.md"):
+        if path.is_file() and _is_memory_source(path, root):
+            yield path
+
+
+def _context_value(context: Any, name: str, default: Any = None) -> Any:
+    if isinstance(context, dict):
+        return context.get(name, default)
+    return getattr(context, name, default)
+
+
+def _root_parts(value: Any) -> tuple[Path, tuple[str, ...]]:
+    if isinstance(value, MemoryRoot):
+        return value.path, tuple(value.tags)
+    if isinstance(value, dict):
+        return Path(value["path"]), _normalize_tags(value.get("tags"))
+    path = getattr(value, "path", value)
+    tags = getattr(value, "tags", ())
+    return Path(path), tuple(tags)
+
+
+def _enumerate_source_state(
+    context: Any, *, global_only: bool = False, include_global: bool = True
+) -> tuple[list[dict[str, Any]], dict[str, bool]]:
+    status = str(_context_value(context, "status", "unavailable"))
+    resolved = status == "resolved" and bool(_context_value(context, "project_id"))
+    roots: list[tuple[Any, str]] = []
+    if include_global:
+        roots.extend(
+            (root, "global")
+            for root in _context_value(context, "global_roots", ()) or ()
+        )
+    if resolved and not global_only:
+        roots.extend(
+            (root, "project")
+            for root in _context_value(context, "project_roots", ()) or ()
+        )
+
+    known = {
+        "global": include_global and _context_value(context, "global_roots", None) is not None,
+        "project": resolved
+        and not global_only
+        and _context_value(context, "project_roots", None) is not None,
+    }
+    aggregated: dict[Path, dict[str, Any]] = {}
+    for raw_root, logical_scope in roots:
+        try:
+            root, root_tags = _root_parts(raw_root)
+            root = root.expanduser().resolve(strict=False)
+            if not root.is_dir():
+                known[logical_scope] = False
+                continue
+            for path in _iter_memory_sources(root):
+                canonical = path.resolve(strict=False)
+                item = aggregated.setdefault(
+                    canonical,
+                    {"path": str(canonical), "scopes": set(), "root_tags": set()},
+                )
+                item["scopes"].add(logical_scope)
+                item["root_tags"].update(root_tags)
+        except (OSError, ValueError, TypeError, MemoryError):
+            known[logical_scope] = False
+
+    result: list[dict[str, Any]] = []
+    for path, item in sorted(aggregated.items(), key=lambda pair: str(pair[0])):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            title, brief, tags, _ = _derive_metadata(path, text, item["root_tags"])
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            for scope in item["scopes"]:
+                known[scope] = False
+            continue
+        result.append(
+            {
+                "path": item["path"],
+                "scopes": sorted(item["scopes"]),
+                "tags": list(tags),
+                "title": title,
+                "brief": brief,
+                "mtime_ns": mtime_ns,
+            }
+        )
+    return result, known
+
+
+def enumerate_sources(context: Any) -> list[dict[str, Any]]:
+    """Enumerate visible physical Markdown sources without touching the index."""
+    sources, _ = _enumerate_source_state(context)
+    return sources
+
+
 def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, int]:
     aggregated: dict[Path, dict[str, set[str]]] = {}
     missing_roots = 0
@@ -309,9 +430,7 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
             continue
         if not root.path.is_dir():
             raise MemoryError(f"memory root is not a directory: {root.path}")
-        for path in root.path.rglob("*.md"):
-            if not path.is_file():
-                continue
+        for path in _iter_memory_sources(root.path):
             canonical = path.resolve(strict=False)
             entry = aggregated.setdefault(canonical, {"scopes": set(), "tags": set()})
             entry["scopes"].add(root.scope)
@@ -892,6 +1011,216 @@ def list_documents(
     sql += " ORDER BY d.mtime_ns DESC,d.path LIMIT ?"
     params.append(limit)
     return [_doc_payload(conn, row) for row in conn.execute(sql, params)]
+
+
+def _inventory_scopes(
+    context: Any, filters: dict[str, Any]
+) -> tuple[list[str], str | None, bool]:
+    project = _context_value(context, "project_id")
+    resolved = (
+        str(_context_value(context, "status", "unavailable")) == "resolved"
+        and bool(project)
+    )
+    global_only = bool(
+        filters.get("global", False) or filters.get("global_only", False)
+    )
+    include_global = bool(
+        filters.get("include_global", filters.get("include_shared", True))
+    )
+    scopes: list[str] = []
+    if include_global:
+        scopes.append(SHARED_SCOPE)
+    if resolved and not global_only:
+        scopes.append(str(project))
+    return scopes, str(project) if resolved and not global_only else None, global_only
+
+
+def _tag_filter_matches(tags: Iterable[str], requested: Iterable[str]) -> bool:
+    available = [":" + tag.casefold() + ":" for tag in tags]
+    for raw in requested:
+        segments = _normalize_tag(raw).casefold().split(":")
+        if not any(all(f":{segment}:" in tag for segment in segments) for tag in available):
+            return False
+    return True
+
+
+def _requested_tags(filters: dict[str, Any]) -> tuple[str, ...]:
+    value = filters.get("tags", ()) or ()
+    return (value,) if isinstance(value, str) else tuple(value)
+
+
+def _unknown_inventory() -> dict[str, Any]:
+    return {
+        "counts": {"distinct": None, "global": None, "project": None},
+        "tags": [],
+        "route_candidates": [],
+    }
+
+
+def _navigation_inventory_db(
+    conn: sqlite3.Connection, context: Any, filters: dict[str, Any]
+) -> dict[str, Any]:
+    scopes, project, global_only = _inventory_scopes(context, filters)
+    if not scopes:
+        return _unknown_inventory()
+    placeholders = ",".join("?" for _ in scopes)
+    visible_sql = (
+        "SELECT DISTINCT d.id FROM documents d JOIN document_scopes vs "
+        f"ON vs.document_id=d.id WHERE vs.scope IN ({placeholders})"
+    )
+    visible_params: list[Any] = list(scopes)
+    for tag in _requested_tags(filters):
+        visible_sql = _append_tag_filter(visible_sql, visible_params, tag)
+    visible_ids = [int(row[0]) for row in conn.execute(visible_sql, visible_params)]
+    visible_set = set(visible_ids)
+
+    def scope_count(scope: str) -> int:
+        return int(
+            conn.execute(
+                "SELECT count(DISTINCT document_id) FROM document_scopes "
+                "WHERE scope=? AND document_id IN (" + visible_sql + ")",
+                [scope, *visible_params],
+            ).fetchone()[0]
+        )
+
+    global_count = scope_count(SHARED_SCOPE) if SHARED_SCOPE in scopes else 0
+    status_resolved = str(_context_value(context, "status", "unavailable")) == "resolved"
+    project_count: int | None
+    if global_only:
+        project_count = 0
+    elif project is not None:
+        project_count = scope_count(project)
+    elif status_resolved:
+        project_count = 0
+    else:
+        project_count = None
+
+    tags: list[dict[str, Any]] = []
+    if visible_ids:
+        ids_sql = ",".join("?" for _ in visible_ids)
+        tags = [
+            {"tag": str(row[0]), "count": int(row[1])}
+            for row in conn.execute(
+                "SELECT tag,count(DISTINCT document_id) AS n FROM document_tags "
+                f"WHERE document_id IN ({ids_sql}) GROUP BY tag "
+                "ORDER BY n DESC,lower(tag),tag LIMIT 5",
+                visible_ids,
+            )
+        ]
+
+    candidate_sql = "SELECT d.id,d.path,d.title,d.brief FROM documents d WHERE 1=1"
+    candidate_params: list[Any] = []
+    if visible_ids:
+        candidate_sql += " AND d.id IN (" + ",".join("?" for _ in visible_ids) + ")"
+        candidate_params.extend(visible_ids)
+    else:
+        candidate_sql += " AND 0"
+    candidate_sql += " ORDER BY d.mtime_ns DESC,d.path LIMIT ?"
+    try:
+        limit = max(0, min(int(filters.get("limit", 6)), 20))
+    except (TypeError, ValueError):
+        limit = 6
+    candidate_params.append(limit)
+    candidates = []
+    for row in conn.execute(candidate_sql, candidate_params):
+        payload = _doc_payload(conn, row)
+        payload["projects"] = [scope for scope in payload["projects"] if scope in scopes]
+        candidates.append(payload)
+    return {
+        "counts": {
+            "distinct": len(visible_set),
+            "global": global_count,
+            "project": project_count,
+        },
+        "tags": tags,
+        "route_candidates": candidates,
+    }
+
+
+def navigation_inventory(context: Any, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a bounded, scope-safe inventory separate from search results.
+
+    The function is deliberately SELECT-only.  If a caller supplies a read-only
+    SQLite connection as ``context.connection`` (or ``context.conn``), it uses
+    indexed metadata.  Otherwise it derives the same navigation facts in memory
+    from the context roots, so a missing cache does not make memory undiscoverable.
+    """
+    filters = dict(filters or {})
+    conn = _context_value(context, "connection", _context_value(context, "conn"))
+    if conn is not None:
+        try:
+            return _navigation_inventory_db(conn, context, filters)
+        except (sqlite3.Error, KeyError, TypeError, ValueError, MemoryError):
+            return _unknown_inventory()
+
+    _, project, global_only = _inventory_scopes(context, filters)
+    include_global = bool(
+        filters.get("include_global", filters.get("include_shared", True))
+    )
+    sources, known = _enumerate_source_state(
+        context, global_only=global_only, include_global=include_global
+    )
+    if not sources and not any(known.values()):
+        return _unknown_inventory()
+    visible = [
+        item
+        for item in sources
+        if (include_global and "global" in item["scopes"])
+        or (project is not None and "project" in item["scopes"])
+    ]
+    requested_tags = _requested_tags(filters)
+    filtered = [
+        item for item in visible if _tag_filter_matches(item["tags"], requested_tags)
+    ]
+    global_count = (
+        0
+        if not include_global
+        else sum("global" in item["scopes"] for item in filtered)
+        if known["global"]
+        else None
+    )
+    if global_only:
+        project_count: int | None = 0
+    elif project is None:
+        project_count = None
+    else:
+        project_count = (
+            sum("project" in item["scopes"] for item in filtered)
+            if known["project"]
+            else None
+        )
+    required_scopes = (["global"] if include_global else []) + (
+        ["project"] if project else []
+    )
+    distinct = len(filtered) if all(known[scope] for scope in required_scopes) else None
+    counts: dict[str, int] = {}
+    for item in filtered:
+        for tag in set(item["tags"]):
+            counts[tag] = counts.get(tag, 0) + 1
+    tags = [
+        {"tag": tag, "count": count}
+        for tag, count in sorted(
+            counts.items(), key=lambda pair: (-pair[1], pair[0].casefold(), pair[0])
+        )[:5]
+    ]
+    candidates = list(filtered)
+    candidates.sort(key=lambda item: (-item["mtime_ns"], item["path"]))
+    try:
+        limit = max(0, min(int(filters.get("limit", 6)), 20))
+    except (TypeError, ValueError):
+        limit = 6
+    for item in candidates:
+        item.pop("mtime_ns", None)
+        item.pop("root_tags", None)
+    return {
+        "counts": {
+            "distinct": distinct,
+            "global": global_count,
+            "project": project_count,
+        },
+        "tags": tags,
+        "route_candidates": candidates[:limit],
+    }
 
 
 def resolve_document(conn: sqlite3.Connection, ref: str) -> sqlite3.Row:
