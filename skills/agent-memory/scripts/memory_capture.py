@@ -109,6 +109,7 @@ def capture_memory(
     root=None,
     memory_id=None,
     status="raw",
+    tier=None,
     allow_duplicate=False,
 ):
     if kind not in KINDS:
@@ -121,6 +122,10 @@ def capture_memory(
     status = status.strip().lower()
     if status not in LIFECYCLE_STATES:
         raise MemoryError(f"unsupported lifecycle status: {status}")
+    if tier is not None:
+        tier = str(tier).strip().lower()
+        if tier not in {"core", "archive"}:
+            raise MemoryError(f"unsupported tier: {tier}")
     duplicates = find_capture_duplicates(binding, summary)
     if duplicates and not allow_duplicate:
         return {
@@ -158,6 +163,7 @@ def capture_memory(
         f'brief: "{brief}"',
         f"type: {kind}",
         f"status: {status}",
+        *([f"tier: {tier}"] if tier is not None else []),
         "tags: [" + ", ".join(canonical) + "]",
         "---",
         "",
@@ -186,4 +192,5 @@ def capture_memory(
         "status": status,
         "tags": list(canonical),
         "possible_duplicates": duplicates,
+        **({"tier": tier} if tier is not None else {}),
     }
