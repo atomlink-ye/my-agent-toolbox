@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Any, Iterable
 
@@ -50,20 +51,54 @@ def _count(conn: sqlite3.Connection, scope: str, tags: tuple[str, ...]) -> int:
 
 
 def _sample(
-    conn: sqlite3.Connection, scope: str, tags: tuple[str, ...], limit: int
+    conn: sqlite3.Connection,
+    scope: str,
+    tags: tuple[str, ...],
+    limit: int,
+    context_terms: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
     tag_sql, tag_params = _tag_predicates(tags)
     rows = conn.execute(
-        "SELECT d.id,d.title,d.path FROM documents d "
+        "SELECT d.id,d.title,d.brief,d.path,d.mtime_ns,"
+        "(SELECT group_concat(t.tag,' ') FROM document_tags t WHERE t.document_id=d.id) AS tags "
+        "FROM documents d "
         "WHERE EXISTS (SELECT 1 FROM document_scopes s "
         "WHERE s.document_id=d.id AND s.scope=?)" + tag_sql
-        + " ORDER BY d.mtime_ns DESC,d.path LIMIT ?",
-        [scope, *tag_params, limit],
-    )
+        + " ORDER BY d.mtime_ns DESC,d.path",
+        [scope, *tag_params],
+    ).fetchall()
+    terms = {
+        token
+        for term in context_terms
+        for token in re.findall(r"[^\W_]+", term.casefold(), flags=re.UNICODE)
+    }
+
+    def rank(row: sqlite3.Row) -> tuple[int, int, str, str]:
+        metadata = " ".join(
+            str(row[name] or "") for name in ("title", "brief", "tags", "path")
+        ).casefold()
+        candidate_terms = set(
+            re.findall(r"[^\W_]+", metadata, flags=re.UNICODE)
+        )
+        relevance = len(terms & candidate_terms)
+        return (
+            -relevance,
+            -int(row["mtime_ns"]),
+            str(row["path"]).casefold(),
+            str(row["path"]),
+        )
+
+    rows = sorted(rows, key=rank)[:limit]
     return [
-        {"id": int(row["id"]), "title": row["title"], "path": row["path"], "scope": scope}
+        {
+            "id": int(row["id"]),
+            "title": row["title"],
+            "brief": row["brief"],
+            "path": row["path"],
+            "scope": scope,
+        }
         for row in rows
     ]
 
@@ -77,6 +112,7 @@ def navigation_inventory(
     global_limit: int = 2,
     project_limit: int = 4,
     tag_limit: int = 5,
+    context_terms: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Return independently counted scope components plus a bounded index."""
     tags = tuple(tags)
@@ -102,8 +138,23 @@ def navigation_inventory(
         [*visible_params, *tag_params, max(0, tag_limit)],
     )
     top_tags = [{"tag": row["tag"], "count": int(row["count"])} for row in tag_rows]
-    global_rows = _sample(conn, SHARED_SCOPE, tags, global_limit) if include_shared else []
-    project_rows = _sample(conn, project, tags, project_limit) if project else []
+    context_terms = tuple(context_terms)
+    global_rows = (
+        _sample(conn, SHARED_SCOPE, tags, global_limit, context_terms)
+        if include_shared
+        else []
+    )
+    project_rows = _sample(conn, project, tags, project_limit, context_terms) if project else []
+    project_summaries = [
+        {"project": str(row["scope"]), "count": int(row["count"])}
+        for row in conn.execute(
+            "SELECT s.scope,count(DISTINCT d.id) AS count "
+            "FROM document_scopes s JOIN documents d ON d.id=s.document_id "
+            "WHERE s.scope<>?" + tag_sql
+            + " GROUP BY s.scope ORDER BY lower(s.scope),s.scope",
+            [SHARED_SCOPE, *tag_params],
+        )
+    ]
     shown = {row["id"] for row in [*global_rows, *project_rows]}
     return {
         "counts": {
@@ -115,5 +166,6 @@ def navigation_inventory(
         "tags": top_tags,
         "global": global_rows,
         "project": project_rows,
+        "project_summaries": project_summaries,
         "omitted": max(0, visible - len(shown)),
     }

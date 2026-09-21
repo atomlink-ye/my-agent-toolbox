@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 SHARED_SCOPE = "_shared"
 SCHEMA_VERSION = 1
@@ -110,6 +113,120 @@ def load_settings(path: Path) -> dict[str, Any]:
     ):
         raise MemoryError("settings `bindings` and `shared` must be arrays")
     return Settings(data, path)
+
+
+@contextmanager
+def _settings_update_lock(settings_path: Path) -> Iterator[None]:
+    """Hold a stable sibling lock across one settings read-modify-write transaction."""
+    lock_path = settings_path.with_name(settings_path.name + ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    locked = False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        if locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _register_project_locked(
+    settings_path: Path,
+    project_path: Path,
+    project: str,
+    memory_root: Path,
+) -> dict[str, Any]:
+    if not project:
+        raise MemoryError("project name must not be empty")
+    if not project_path.is_dir():
+        raise MemoryError(f"project path is not a directory: {project_path}")
+    if memory_root != project_path / ".learnings" or not memory_root.is_dir():
+        raise MemoryError(
+            f"memory root must be the existing project .learnings directory: {project_path / '.learnings'}"
+        )
+
+    settings = load_settings(settings_path)
+    bindings = flatten_bindings(settings)
+    existing_at_path = [item for item in bindings if item.path == project_path]
+    if existing_at_path:
+        if any(
+            item.project == project
+            and any(location.path == memory_root for location in item.memory_roots)
+            for item in existing_at_path
+        ):
+            return {
+                "status": "already_registered",
+                "project": project,
+                "path": str(project_path),
+                "memory_root": str(memory_root),
+                "settings": str(settings_path),
+            }
+        raise MemoryError(f"project path already has a different binding: {project_path}")
+
+    root_owners = {
+        item.project
+        for item in bindings
+        if any(location.path == memory_root for location in item.memory_roots)
+    }
+    if root_owners and root_owners != {project}:
+        raise MemoryError(
+            f"memory root is already assigned to another project: {', '.join(sorted(root_owners))}"
+        )
+
+    updated = dict(settings)
+    updated["bindings"] = [
+        *settings.get("bindings", []),
+        {"path": str(project_path), "project": project, "memory": [str(memory_root)]},
+    ]
+    flatten_bindings(updated)
+    encoded = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
+
+    original_mode = settings_path.stat().st_mode & 0o777
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{settings_path.name}.", suffix=".tmp", dir=settings_path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_path, original_mode)
+        os.replace(temporary_path, settings_path)
+        directory_fd = os.open(settings_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return {
+        "status": "registered",
+        "project": project,
+        "path": str(project_path),
+        "memory_root": str(memory_root),
+        "settings": str(settings_path),
+    }
+
+
+def register_project(
+    settings_path: Path,
+    project_path: Path,
+    project: str,
+    memory_root: Path | None = None,
+) -> dict[str, Any]:
+    """Explicitly add one project whose memory root is its .learnings directory."""
+    settings_path = settings_path.expanduser().resolve(strict=False)
+    project_path = project_path.expanduser().resolve(strict=False)
+    memory_root = (memory_root or project_path / ".learnings").expanduser().resolve(strict=False)
+    project = project.strip()
+    with _settings_update_lock(settings_path):
+        return _register_project_locked(settings_path, project_path, project, memory_root)
 
 
 def database_path(settings: dict[str, Any], settings_path: Path) -> Path:

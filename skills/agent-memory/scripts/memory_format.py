@@ -207,12 +207,31 @@ def navigation_text(payload: dict[str, Any]) -> str:
         lines.append("configured_projects: " + ", ".join(_safe_text(x) for x in candidates[:3]))
     if payload.get("diagnostic"):
         lines.append("diagnostic: " + _safe_text(payload["diagnostic"]))
+    diagnostics = payload.get("diagnostics", [])
+    if diagnostics:
+        codes = [
+            _safe_text(item.get("code", "unknown"))
+            for item in diagnostics
+            if isinstance(item, dict)
+        ]
+        if codes:
+            lines.append("diagnostics: " + ", ".join(codes))
     rows = payload.get("navigation", [])
     if rows:
         lines.append("navigation:")
         for row in rows:
             lines.append(f"- [{_safe_text(row.get('scope', ''))}] {_safe_text(row.get('title', ''))}")
             lines.append(f"  {_safe_text(row.get('path', ''))}")
+            if row.get("brief"):
+                lines.append(f"  brief: {_safe_text(row['brief'])}")
+    summaries = payload.get("project_summaries", [])
+    if summaries:
+        lines.append("other projects:")
+        lines.extend(
+            f"- {_safe_text(item.get('project', 'unknown'))} ({item.get('count', 0)})"
+            for item in summaries
+            if isinstance(item, dict)
+        )
     lines.append(f"omitted: {payload.get('omitted', 0)}")
     lines.append("note: navigation, not search hits")
     commands = payload.get("next_commands", [])
@@ -229,6 +248,24 @@ def _recount_omitted(payload: dict[str, Any]) -> None:
         payload["omitted"] = max(0, distinct - len(shown))
 
 
+def _prune_navigation_brief(payload: dict[str, Any]) -> bool:
+    """Shorten one selected brief before dropping its navigation candidate."""
+    rows = [
+        row
+        for row in payload.get("navigation", [])
+        if isinstance(row, dict) and isinstance(row.get("brief"), str) and row["brief"]
+    ]
+    if not rows:
+        return False
+    row = max(rows, key=lambda item: len(item["brief"].encode("utf-8")))
+    brief = row["brief"]
+    if len(brief) > 64:
+        row["brief"] = brief[: max(32, len(brief) // 2)].rstrip() + "…"
+    else:
+        row.pop("brief", None)
+    return True
+
+
 def bounded_navigation_text(payload: dict[str, Any], budget: int = OUTPUT_BUDGET) -> str:
     """Prune optional navigation data until the UTF-8 packet fits."""
     item = copy.deepcopy(payload)
@@ -239,6 +276,10 @@ def bounded_navigation_text(payload: dict[str, Any], budget: int = OUTPUT_BUDGET
         item["truncated"] = True
         if item.get("tags"):
             item["tags"].pop()
+        elif item.get("project_summaries"):
+            item["project_summaries"].pop()
+        elif _prune_navigation_brief(item):
+            pass
         elif len(item.get("navigation", [])) > 1:
             item["navigation"].pop()
             _recount_omitted(item)
@@ -274,6 +315,10 @@ def bounded_json(payload: dict[str, Any], budget: int = OUTPUT_BUDGET) -> str:
         item["truncated"] = True
         if item.get("tags"):
             item["tags"].pop()
+        elif item.get("project_summaries"):
+            item["project_summaries"].pop()
+        elif _prune_navigation_brief(item):
+            pass
         elif len(item.get("navigation", [])) > 1:
             item["navigation"].pop()
             _recount_omitted(item)
