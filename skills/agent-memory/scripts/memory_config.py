@@ -24,6 +24,14 @@ class AmbiguousDescendantBindingError(MemoryError):
     """Raised when an ancestor path would require guessing between projects."""
 
 
+class Settings(dict[str, Any]):
+    """Settings mapping that retains its read-only path resolution origin."""
+
+    def __init__(self, values: dict[str, Any], source_path: Path):
+        super().__init__(values)
+        self.source_path = source_path.resolve(strict=False)
+
+
 @dataclass(frozen=True)
 class MemoryLocation:
     path: Path
@@ -101,7 +109,7 @@ def load_settings(path: Path) -> dict[str, Any]:
         data.get("shared", []), list
     ):
         raise MemoryError("settings `bindings` and `shared` must be arrays")
-    return data
+    return Settings(data, path)
 
 
 def database_path(settings: dict[str, Any], settings_path: Path) -> Path:
@@ -320,3 +328,12 @@ def resolve_project_binding(settings: dict[str, Any], project: str) -> Binding:
         f"project name {project!r} matches multiple bindings: {paths}; "
         "use --path for one binding (see `agent-memory projects` or `agent-memory browse`)"
     )
+
+
+def resolve_context(
+    settings: dict[str, Any], target: str | os.PathLike[str], explicit_project: str | None = None
+):
+    """Lazily expose the read-only identity resolver without an import cycle."""
+    from memory_identity import resolve_context as resolve_identity_context
+
+    return resolve_identity_context(settings, target, explicit_project)

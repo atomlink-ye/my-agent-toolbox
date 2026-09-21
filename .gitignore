@@ -30,3 +30,4 @@ __pycache__/
 # Skill Creator / ad-hoc skill evaluation artifacts
 skills/*/evals/
 .skill-evals/
+artifacts/

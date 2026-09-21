@@ -7,10 +7,15 @@ by both YAML 1.1 and YAML 1.2 parsers without adding a runtime dependency.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import os
 import re
+from pathlib import Path
 from typing import Any, Iterable
+
+OUTPUT_BUDGET = 2048
 
 _PLAIN_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 _YAML_BOOL_OR_NULL = {"null", "true", "false", "yes", "no", "on", "off", "y", "n", "~"}
@@ -110,6 +115,190 @@ def yaml_dump(value: object, indent: int = 0) -> str:
                 raise TypeError(f"unsupported YAML value: {type(item).__name__}")
         return "\n".join(lines)
     raise TypeError(f"unsupported YAML value: {type(value).__name__}")
+
+
+def _compact_path_base(result: list[object], memory_roots: Iterable[Path]) -> Path | None:
+    """Return one base that makes every displayed document path directly resolvable."""
+    paths = [
+        Path(item["path"]).expanduser().resolve(strict=False)
+        for item in result
+        if isinstance(item, dict) and item.get("path")
+    ]
+    roots = [Path(root).expanduser().resolve(strict=False) for root in memory_roots]
+    used_roots = [
+        root
+        for root in roots
+        if any(path == root or root in path.parents for path in paths)
+    ]
+    if not paths or not used_roots:
+        return None
+    try:
+        return Path(os.path.commonpath([str(root) for root in used_roots]))
+    except ValueError:
+        return None
+
+
+def compact_dump(result: object, memory_roots: Iterable[Path] = ()) -> str:
+    """Render search/list rows as routing hints instead of diagnostic records."""
+    if not isinstance(result, list):
+        raise TypeError("compact output requires a list result")
+    if not result:
+        return "(no results)"
+
+    base = _compact_path_base(result, memory_roots)
+    lines = [f"Read paths relative to {base}:"] if base is not None else []
+    for index, item in enumerate(result, 1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "(untitled)").strip()
+        match_mode = str(item.get("match_mode") or "strict").strip()
+        suffix = "" if match_mode == "strict" else f" ~{match_mode}"
+        lines.append(f"{index}. {title}{suffix}")
+
+        brief = str(item.get("brief") or "").strip()
+        if brief and brief != title:
+            lines.append(f"   {brief}")
+
+        raw_path = Path(str(item.get("path") or "")).expanduser()
+        display_path = raw_path
+        if base is not None:
+            try:
+                display_path = raw_path.resolve(strict=False).relative_to(base)
+            except ValueError:
+                pass
+        lines.append(f"   {display_path}")
+    return "\n".join(lines)
+
+
+def _safe_text(value: object) -> str:
+    """Keep navigation output single-line and harmless to terminals."""
+    return " ".join(str(value).replace("\x1b", "?").split())
+
+
+def navigation_text(payload: dict[str, Any]) -> str:
+    """Render an opening/no-match packet as terse, readable routing data."""
+    scope = payload.get("scope", {})
+    project = scope.get("project") or "unknown"
+    parts = [f"status={_safe_text(payload.get('status', 'unknown'))}"]
+    if payload.get("query") is not None:
+        parts.append(f"match_mode={_safe_text(payload.get('match_mode', 'none'))}")
+    parts.extend(
+        [
+            f"project={_safe_text(project)}",
+            f"source={_safe_text(scope.get('source', 'unknown'))}",
+        ]
+    )
+    lines = [" ".join(parts)]
+    counts = payload.get("counts", {})
+    lines.append(
+        "counts: distinct={} global={} project={} (components may overlap)".format(
+            counts.get("distinct", "unknown"),
+            counts.get("global", "unknown"),
+            counts.get("project", "unknown") if counts.get("project") is not None else "unknown",
+        )
+    )
+    tags = payload.get("tags", [])
+    if tags:
+        lines.append(
+            "tags: " + ", ".join(f"{_safe_text(item['tag'])}({item['count']})" for item in tags)
+        )
+    candidates = payload.get("configured_projects", [])
+    if candidates:
+        lines.append("configured_projects: " + ", ".join(_safe_text(x) for x in candidates[:3]))
+    if payload.get("diagnostic"):
+        lines.append("diagnostic: " + _safe_text(payload["diagnostic"]))
+    rows = payload.get("navigation", [])
+    if rows:
+        lines.append("navigation:")
+        for row in rows:
+            lines.append(f"- [{_safe_text(row.get('scope', ''))}] {_safe_text(row.get('title', ''))}")
+            lines.append(f"  {_safe_text(row.get('path', ''))}")
+    lines.append(f"omitted: {payload.get('omitted', 0)}")
+    lines.append("note: navigation, not search hits")
+    commands = payload.get("next_commands", [])
+    lines.append("next: " + _safe_text(commands[0] if commands else "agent-memory brief"))
+    if payload.get("truncated"):
+        lines.append("truncated: true")
+    return "\n".join(lines)
+
+
+def _recount_omitted(payload: dict[str, Any]) -> None:
+    distinct = payload.get("counts", {}).get("distinct")
+    if isinstance(distinct, int):
+        shown = {row.get("id", row.get("path")) for row in payload.get("navigation", [])}
+        payload["omitted"] = max(0, distinct - len(shown))
+
+
+def bounded_navigation_text(payload: dict[str, Any], budget: int = OUTPUT_BUDGET) -> str:
+    """Prune optional navigation data until the UTF-8 packet fits."""
+    item = copy.deepcopy(payload)
+    while True:
+        rendered = navigation_text(item) + "\n"
+        if len(rendered.encode("utf-8")) <= budget:
+            return rendered
+        item["truncated"] = True
+        if item.get("tags"):
+            item["tags"].pop()
+        elif len(item.get("navigation", [])) > 1:
+            item["navigation"].pop()
+            _recount_omitted(item)
+        elif len(str(item.get("query", ""))) > 24:
+            item["query"] = _safe_text(item["query"])[:24] + "…"
+        elif item.get("navigation"):
+            item["navigation"].pop()
+            _recount_omitted(item)
+        elif item.get("configured_projects"):
+            item["configured_projects"].pop()
+        elif len(str(item.get("diagnostic", ""))) > 160:
+            item["diagnostic"] = _safe_text(item["diagnostic"])[:160] + "…"
+        else:
+            # The mandatory core is intentionally short.  This branch is only a
+            # last defense for a caller-provided microscopic budget.
+            core = "status={} scope={} count={} omitted={} next={}\n".format(
+                _safe_text(item.get("status", "unknown")),
+                "unknown",
+                item.get("counts", {}).get("distinct", "unknown"),
+                item.get("omitted", 0),
+                "agent-memory brief",
+            )
+            return core.encode("utf-8")[:budget].decode("utf-8", "ignore")
+
+
+def bounded_json(payload: dict[str, Any], budget: int = OUTPUT_BUDGET) -> str:
+    """Serialize a structured packet while enforcing the same byte budget."""
+    item = copy.deepcopy(payload)
+    while True:
+        rendered = json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+        if len(rendered.encode("utf-8")) <= budget:
+            return rendered
+        item["truncated"] = True
+        if item.get("tags"):
+            item["tags"].pop()
+        elif len(item.get("navigation", [])) > 1:
+            item["navigation"].pop()
+            _recount_omitted(item)
+        elif len(str(item.get("query", ""))) > 24:
+            item["query"] = _safe_text(item["query"])[:24] + "…"
+        elif item.get("navigation"):
+            item["navigation"].pop()
+            _recount_omitted(item)
+        elif item.get("configured_projects"):
+            item["configured_projects"].pop()
+        elif len(str(item.get("diagnostic", ""))) > 160:
+            item["diagnostic"] = _safe_text(item["diagnostic"])[:160] + "…"
+        elif (
+            len(str(item.get("project", ""))) > 128
+            or len(str(item.get("scope", {}).get("project", ""))) > 128
+            or len(str((item.get("next_commands") or [""])[0])) > 256
+        ):
+            item["project"] = None
+            item.setdefault("scope", {})["project"] = None
+            item["scope"]["identity_truncated"] = True
+            item["next_commands"] = ["agent-memory brief"]
+        else:
+            # Required envelopes are comfortably smaller than 2 KiB after the
+            # optional fields above are gone.
+            raise ValueError("navigation JSON core exceeds output budget")
 
 
 def _display(value: object, limit: int = 64) -> str:

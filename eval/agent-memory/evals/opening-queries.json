@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "purpose": "Fixed real-world opening-query observations plus environment-independent navigation acceptance criteria.",
+  "provenance": {
+    "kind": "user-scenario-observation",
+    "observed_at": "2026-09-21",
+    "environment": {
+      "corpus": "/home/agent/am/amcorpus",
+      "corpus_markdown_documents": 523,
+      "scope": "one shared root containing the full corpus",
+      "search_limit": 10,
+      "command": "python3 skills/agent-memory/scripts/agent_memory.py --settings <temporary-settings> --json search <query>"
+    },
+    "note": "Observed hit counts are provenance, not fixed expectations; scope, settings, corpus, retrieval implementation, and limit can change them."
+  },
+  "metrics": {
+    "actionable": "8/8",
+    "dead_end": 0
+  },
+  "actionable_definition": "The response contains a successful executable next-command route even when results is empty.",
+  "dead_end_definition": "A successful response with neither a result route nor an executable navigation route.",
+  "cases": [
+    {"query": "memory", "observed_hit_count": 10},
+    {"query": "how do I start", "observed_hit_count": 1},
+    {"query": "conventions", "observed_hit_count": 0},
+    {"query": "what should I know", "observed_hit_count": 10},
+    {"query": "setup", "observed_hit_count": 10},
+    {"query": "记忆", "observed_hit_count": 0},
+    {"query": "best practices", "observed_hit_count": 3},
+    {"query": "gotchas", "observed_hit_count": 0}
+  ],
+  "synthetic_fixture": {
+    "all_queries_zero_match": true,
+    "expected_results": [],
+    "requires_executable_navigation": true,
+    "same_cwd_settings_scope_and_budget": true
+  }
+}

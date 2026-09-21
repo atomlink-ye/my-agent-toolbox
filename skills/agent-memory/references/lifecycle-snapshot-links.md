@@ -1,5 +1,9 @@
 # Lifecycle, snapshot, and links (low-frequency machinery)
 
+These operations are not substitutes for the normal brief-first consumption loop. Start
+with the current scope map, read a routed topic, and enter this reference only when that
+topic or the task specifically calls for lifecycle, snapshot, or link work.
+
 These subcommands exist and work, but in real historical usage across 1038 logged
 `agent-memory` invocations, `lifecycle` was called 1 time, `links` 2 times, and
 `snapshot` 0 times. Do not reach for this section on a normal recall/capture loop;

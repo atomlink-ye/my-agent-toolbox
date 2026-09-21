@@ -32,14 +32,44 @@ The main bundled skills are shipped under a single plugin (`my-skills`).
 
 ## Agent Memory quick start
 
+Resolve the directory of the `agent-memory` skill that your runtime actually loaded; do
+not guess it from CWD. A discovered standalone skill does not necessarily install a bare
+command:
+
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/skills/agent-memory/scripts/setup.sh"
-agent-memory sync
-agent-memory doctor --path "$WORK_DIR"
-agent-memory search "learnings agent server" --path "$WORK_DIR"
-agent-memory capture learning "Reusable learning" --path "$WORK_DIR"
-agent-memory lifecycle mem_abc promoted --target mem_canonical
+AM_SKILL_DIR=/absolute/path/to/loaded/agent-memory
+if ! test -f "$AM_SKILL_DIR/SKILL.md" || \
+   ! test -f "$AM_SKILL_DIR/scripts/agent_memory.py"; then
+  printf '%s\n' "invalid agent-memory skill directory: $AM_SKILL_DIR" >&2
+  exit 2
+fi
+if command -v agent-memory >/dev/null 2>&1; then
+  AM=(agent-memory)
+else
+  AM=(python3 "$AM_SKILL_DIR/scripts/agent_memory.py")
+fi
+"${AM[@]}" --json status
 ```
+
+Status exits `0` when ready. If and only if it reports `settings not found`, complete a
+fresh bootstrap:
+
+```bash
+"${AM[@]}" --json init
+"${AM[@]}" --json sync
+"${AM[@]}" --json status
+"${AM[@]}" search "learnings agent server" --path /abs/path/to/project
+```
+
+Requirements: Python 3.10+, standard-library SQLite with FTS5, and the complete skill
+`scripts/` directory. `init` creates settings and `sync` creates the index. On an existing
+registry, classify with `status`: run only `sync` for a missing index, and do not overwrite
+malformed settings or a corrupt database with `init --force`.
+
+Claude Code plugin content may set
+`AM_SKILL_DIR="${CLAUDE_PLUGIN_ROOT}/skills/agent-memory"`; this repository has not
+end-to-end verified that runtime substitution, and ordinary Bash, Codex, and standalone
+skill copies must use the actual absolute skill directory instead.
 
 Stable cross-project references use `memory://mem_xxx`. Legacy Markdown remains valid; explicit ID migration is available through `skills/agent-memory/scripts/migrate_ids.py`.
 

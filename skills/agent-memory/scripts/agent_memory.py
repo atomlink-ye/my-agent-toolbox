@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, sqlite3, sys
+import argparse, json, shlex, sqlite3, sys
 from pathlib import Path
 from memory_admin import preferred_capture_root, project_inventory, tag_inventory
 from memory_doctor_ext import doctor
@@ -19,7 +19,16 @@ from memory_config import (
     resolve_project_binding,
     shared_roots,
 )
-from memory_format import table_dump, yaml_dump
+from memory_context import resolve_context
+from memory_format import (
+    OUTPUT_BUDGET,
+    bounded_json,
+    bounded_navigation_text,
+    compact_dump,
+    table_dump,
+    yaml_dump,
+)
+from memory_navigation import navigation_inventory
 from memory_lifecycle import update_lifecycle
 from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 from memory_store_ext import (
@@ -41,12 +50,43 @@ READ_ONLY_DB_COMMANDS = {
     "projects",
     "tags",
     "browse",
+    "brief",
+    "context",
 }
 
 
-def _readonly_connection(db: Path):
+def _sqlite_base_error_code(error: sqlite3.Error):
+    code = getattr(error, "sqlite_errorcode", None)
+    return None if code is None else code & 0xFF
+
+
+def _database_error_message(error: Exception, db: Path | None) -> str:
+    corrupt = False
+    if isinstance(error, sqlite3.Error):
+        if hasattr(error, "sqlite_errorcode"):
+            corrupt = _sqlite_base_error_code(error) in {
+                sqlite3.SQLITE_CORRUPT,
+                sqlite3.SQLITE_NOTADB,
+            }
+        else:
+            corrupt = str(error).casefold() in {
+                "database disk image is malformed",
+                "file is not a database",
+            }
+    if not corrupt or db is None:
+        return str(error)
+
+    db = db.expanduser().resolve(strict=False)
+    return (
+        f"database is corrupt or invalid: {db} ({error}). Stop all writers; "
+        f"move {db}, {db}-wal, and {db}-shm together into a quarantine "
+        "directory, then run: agent-memory sync. No files were moved."
+    )
+
+
+def _readonly_connection(db: Path, warn: bool = True):
     connection, used_immutable = connect_db_readonly(db)
-    if used_immutable:
+    if used_immutable and warn:
         print(
             "agent-memory: warning: read-only WAL access unavailable; "
             "using an immutable index view",
@@ -73,9 +113,34 @@ def _human_links(result):
                 print(f"  - {link['title']} <- {link['path']}")
 
 
-def _emit(r, cmd, fmt):
+def _slim_json(value, key=None):
+    """Drop empty JSON fields and bound diagnostic score precision."""
+    if isinstance(value, dict):
+        return {
+            child_key: _slim_json(child, child_key)
+            for child_key, child in value.items()
+            if child is not None and child != "" and child != []
+        }
+    if isinstance(value, list):
+        return [_slim_json(child) for child in value]
+    if key == "score" and isinstance(value, float):
+        return round(value, 6)
+    return value
+
+
+def _emit(r, cmd, fmt, verbose=False, memory_roots=()):
     if fmt == "json":
-        print(json.dumps(r, indent=2, ensure_ascii=False))
+        print(
+            json.dumps(
+                r if verbose else _slim_json(r),
+                indent=2 if verbose else None,
+                ensure_ascii=False,
+                separators=None if verbose else (",", ":"),
+            )
+        )
+        return
+    if fmt == "compact":
+        print(compact_dump(r, memory_roots))
         return
     if fmt == "table":
         print(table_dump(cmd, r))
@@ -123,6 +188,13 @@ def _emit(r, cmd, fmt):
 def _opts(p):
     g = p.add_mutually_exclusive_group()
     g.add_argument(
+        "--compact",
+        dest="output_format",
+        action="store_const",
+        const="compact",
+        default=argparse.SUPPRESS,
+    )
+    g.add_argument(
         "--json",
         dest="output_format",
         action="store_const",
@@ -135,6 +207,12 @@ def _opts(p):
         action="store_const",
         const="table",
         default=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="emit the complete pretty-printed JSON diagnostics",
     )
     g.add_argument(
         "--text",
@@ -150,13 +228,21 @@ def _opts(p):
         const="yaml",
         default=argparse.SUPPRESS,
     )
+    g.add_argument(
+        "--envelope",
+        dest="output_format",
+        action="store_const",
+        const="envelope",
+        default=argparse.SUPPRESS,
+        help="emit one structured search response object",
+    )
 
 
 def build_parser():
     p = argparse.ArgumentParser(prog="agent-memory")
     p.add_argument("--settings", type=Path, default=default_settings_path())
     _opts(p)
-    p.set_defaults(output_format=None)
+    p.set_defaults(output_format=None, verbose=False)
     s = p.add_subparsers(dest="command", required=True)
 
     def sub(n, h):
@@ -231,6 +317,14 @@ def build_parser():
     q.add_argument("--tag", action="append", default=[])
     q.add_argument("--limit", type=int, default=100)
     q.add_argument("--no-shared", action="store_true")
+    q = sub("brief", "show a bounded opening inventory for the current project")
+    q.add_argument("--path", type=Path)
+    q = sub("context", "expand the bounded project memory inventory")
+    target = q.add_mutually_exclusive_group()
+    target.add_argument("--path", type=Path)
+    target.add_argument("--project")
+    q.add_argument("--tag", action="append", default=[])
+    q.add_argument("--no-shared", action="store_true")
     q = sub("doctor", "health diagnostics")
     q.add_argument("--path", type=Path)
     return p
@@ -296,19 +390,120 @@ def _browse_documents(conn, project=None, tags=(), limit=100, include_shared=Tru
     }
 
 
+def _scope_command(command, context, tags=(), include_shared=True):
+    project = context.get("project")
+    parts = ["agent-memory", command]
+    if project:
+        parts.extend(["--project", project])
+    elif context.get("path"):
+        parts.extend(["--path", context["path"]])
+    for tag in tags:
+        parts.extend(["--tag", tag])
+    if not include_shared:
+        parts.append("--no-shared")
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _navigation_payload(
+    conn,
+    context,
+    *,
+    status_name,
+    tags=(),
+    include_shared=True,
+    global_limit=2,
+    project_limit=4,
+    tag_limit=5,
+    query=None,
+):
+    registered = context["status"] == "resolved"
+    inventory = navigation_inventory(
+        conn,
+        project=context["project"] if registered else None,
+        tags=tags,
+        include_shared=include_shared,
+        global_limit=global_limit,
+        project_limit=project_limit,
+        tag_limit=tag_limit,
+    )
+    state = status_name
+    if not registered and status_name != "no_match":
+        state = "unregistered"
+    elif inventory["counts"]["distinct"] == 0 and status_name != "no_match":
+        state = "empty"
+    navigation = [*inventory["global"], *inventory["project"]]
+    next_command = _scope_command("context", context, tags, include_shared)
+    if tags:
+        next_command = _scope_command("list", context, tags, include_shared) + " --limit 5"
+    return {
+        "status": state,
+        "project": context.get("project"),
+        "source": context.get("source", "unknown"),
+        "query": query,
+        "match_mode": "none" if query is not None else None,
+        "scope": {
+            "project": context.get("project"),
+            "source": context.get("source", "unknown"),
+            "include_global": include_shared,
+            "tags": list(tags),
+            "resolution_status": context.get("status", "unknown"),
+        },
+        "counts": inventory["counts"],
+        "tags": inventory["tags"] if registered else [],
+        "navigation": navigation if registered else inventory["global"],
+        "configured_projects": context.get("configured_projects", []),
+        "omitted": inventory["omitted"],
+        "next_commands": [next_command if registered else "agent-memory projects"],
+        "truncated": False,
+    }
+
+
+def _emit_bounded_payload(payload, fmt, budget=OUTPUT_BUDGET):
+    if fmt in {"json", "envelope"}:
+        print(bounded_json(payload, budget), end="")
+    else:
+        print(bounded_navigation_text(payload, budget), end="")
+
+
+def _empty_result_text(fmt):
+    if fmt == "json":
+        return "[]\n"
+    if fmt == "compact":
+        return "(no results)\n"
+    if fmt == "yaml":
+        return "[]\n"
+    if fmt == "table":
+        return table_dump("search", []) + "\n"
+    return ""
+
+
 def main(argv=None):
     p = build_parser()
     raw = sys.argv[1:] if argv is None else argv
-    if len({x for x in raw if x in {"--json", "--table", "--text", "--yaml"}}) > 1:
+    if len({x for x in raw if x in {"--compact", "--json", "--table", "--text", "--yaml", "--envelope"}}) > 1:
         p.error("output options are mutually exclusive")
     a = p.parse_args(raw)
-    a.output_format = a.output_format or ("text" if a.command == "browse" else "yaml")
+    if a.output_format == "compact" and a.command not in {"search", "list"}:
+        p.error("--compact is only available for search and list")
+    if a.output_format == "envelope" and a.command not in {"search", "brief", "context"}:
+        p.error("--envelope is only available for search, brief, and context")
+    if a.verbose and a.output_format not in {None, "json"}:
+        p.error("--verbose may only be used with --json")
+    a.output_format = a.output_format or (
+        "json"
+        if a.verbose
+        else "compact"
+        if a.command in {"search", "list"}
+        else "text"
+        if a.command in {"browse", "brief", "context"}
+        else "yaml"
+    )
     sp = a.settings.expanduser().resolve(strict=False)
     if a.command == "init":
         try:
             init_settings(sp, a.force)
             r = {"settings": str(sp)}
-            _emit(r, "init", a.output_format)
+            _emit(r, "init", a.output_format, a.verbose)
             return 0
         except (MemoryError, OSError) as e:
             print(f"agent-memory: {e}", file=sys.stderr)
@@ -319,7 +514,7 @@ def main(argv=None):
             db = database_path(settings, sp)
         except (MemoryError, OSError) as e:
             r = _fail("settings_invalid", str(e), sp)
-            _emit(r, "doctor", a.output_format)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2
         if not db.exists():
             r = _fail(
@@ -327,17 +522,17 @@ def main(argv=None):
                 "SQLite index does not exist; run agent-memory sync first",
                 db,
             )
-            _emit(r, "doctor", a.output_format)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2
         try:
             c = _readonly_connection(db)
             r = doctor(c, settings, sp, db, a.path)
             c.close()
-            _emit(r, "doctor", a.output_format)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2 if r["status"] == "error" else 1 if r["status"] == "warn" else 0
         except Exception as e:
-            r = _fail("doctor_failed", str(e), db)
-            _emit(r, "doctor", a.output_format)
+            r = _fail("doctor_failed", _database_error_message(e, db), db)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2
     if a.command == "snapshot":
         try:
@@ -362,15 +557,16 @@ def main(argv=None):
                     collect_memory_roots(settings, sp),
                     a.output,
                 )
-            _emit(r, "snapshot", a.output_format)
+            _emit(r, "snapshot", a.output_format, a.verbose)
             return 0
         except (MemoryError, OSError, sqlite3.Error) as e:
             print(f"agent-memory: {e}", file=sys.stderr)
             return 2
+    db: Path | None = None
     try:
         settings = load_settings(sp)
         db = database_path(settings, sp)
-        if a.command in {"search", "list", "tags", "browse"}:
+        if a.command in {"search", "list", "tags", "browse", "brief", "context"}:
             # Validate all routing config before a query opens/initializes SQLite.
             flatten_bindings(settings)
             shared_roots(settings, sp)
@@ -397,10 +593,10 @@ def main(argv=None):
                 "shared": [str(x.path) for x in shared_roots(settings, sp)],
                 "tags": list(b.tags),
             }
-            _emit(r, a.command, a.output_format)
+            _emit(r, a.command, a.output_format, a.verbose)
             return 0
         c = (
-            _readonly_connection(db)
+            _readonly_connection(db, warn=a.command not in {"brief", "context"})
             if a.command in READ_ONLY_DB_COMMANDS
             else connect_db(db)
         )
@@ -452,11 +648,123 @@ def main(argv=None):
         elif a.command == "browse":
             project = _query_project(settings, a.project, a.path)
             r = _browse_documents(c, project, a.tag, a.limit, not a.no_shared)
-        _emit(r, a.command, a.output_format)
+        elif a.command in {"brief", "context"}:
+            context = resolve_context(
+                settings,
+                path=a.path,
+                project=getattr(a, "project", None),
+            )
+            r = _navigation_payload(
+                c,
+                context,
+                status_name="ok",
+                tags=tuple(getattr(a, "tag", ())),
+                include_shared=not getattr(a, "no_shared", False),
+                global_limit=2 if a.command == "brief" else 5,
+                project_limit=4 if a.command == "brief" else 15,
+                tag_limit=5 if a.command == "brief" else 10,
+            )
+            _emit_bounded_payload(r, a.output_format)
+            c.close()
+            return 0
+        roots = (
+            [root.path for root in collect_memory_roots(settings, sp)]
+            if a.command in {"search", "list"}
+            else ()
+        )
+        if a.command == "search" and a.output_format == "envelope":
+            context = (
+                resolve_context(settings, path=a.path, project=a.project)
+                if a.path is not None or a.project is not None
+                else resolve_context(settings)
+                if not r
+                else {
+                    "status": "resolved",
+                    "project": None,
+                    "source": "all",
+                    "path": None,
+                    "configured_projects": [],
+                }
+            )
+            packet = _navigation_payload(
+                c,
+                context,
+                status_name="no_match" if not r else "ok",
+                tags=tuple(a.tag),
+                include_shared=not a.no_shared,
+                query=a.query,
+            )
+            packet.update(
+                {
+                    "schema_version": 1,
+                    "results": r,
+                    "navigation": packet["navigation"] if not r else [],
+                    "status": "no_match" if not r else "ok",
+                }
+            )
+            if r:
+                print(json.dumps(packet, ensure_ascii=False, separators=(",", ":")))
+            else:
+                _emit_bounded_payload(packet, "envelope")
+        elif a.command == "search" and not r:
+            stdout = _empty_result_text(a.output_format)
+            print(stdout, end="")
+            context = (
+                resolve_context(settings, path=a.path, project=a.project)
+                if a.path is not None or a.project is not None
+                else resolve_context(settings)
+            )
+            packet = _navigation_payload(
+                c,
+                context,
+                status_name="no_match",
+                tags=tuple(a.tag),
+                include_shared=not a.no_shared,
+                query=a.query,
+            )
+            remaining = max(256, OUTPUT_BUDGET - len(stdout.encode("utf-8")))
+            print(bounded_navigation_text(packet, remaining), end="", file=sys.stderr)
+        else:
+            _emit(r, a.command, a.output_format, a.verbose, roots)
         c.close()
         return 0
     except (MemoryError, OSError, sqlite3.Error) as e:
-        print(f"agent-memory: {e}", file=sys.stderr)
+        message = _database_error_message(e, db)
+        if a.command in {"brief", "context", "search"}:
+            unavailable = {
+                "schema_version": 1,
+                "status": "unavailable",
+                "project": None,
+                "source": "unknown",
+                "query": getattr(a, "query", None),
+                "match_mode": None,
+                "scope": {
+                    "project": None,
+                    "source": "unknown",
+                    "include_global": not getattr(a, "no_shared", False),
+                    "tags": list(getattr(a, "tag", ())),
+                },
+                "counts": {
+                    "distinct": "unknown",
+                    "global": "unknown",
+                    "project": "unknown",
+                    "components_overlap": True,
+                },
+                "results": [],
+                "tags": [],
+                "navigation": [],
+                "configured_projects": [],
+                "omitted": "unknown",
+                "diagnostic": message,
+                "next_commands": ["agent-memory doctor"],
+                "truncated": False,
+            }
+            if a.output_format == "envelope":
+                print(bounded_json(unavailable), end="")
+            else:
+                print(bounded_navigation_text(unavailable), end="", file=sys.stderr)
+        else:
+            print(f"agent-memory: {message}", file=sys.stderr)
         return 2
 
 

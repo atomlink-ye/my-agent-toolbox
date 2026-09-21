@@ -2,6 +2,20 @@
 
 ## Discovery before guessing taxonomy
 
+The normal entry point is the unparameterized task-start brief, not a guessed taxonomy
+term:
+
+```sh
+agent-memory --json brief
+```
+
+Read relevant hook paths directly. Use `context` to expand the current map before using
+the administrative inventory commands below:
+
+```sh
+agent-memory --json context
+```
+
 ```sh
 agent-memory projects
 agent-memory browse --path /abs/path/to/workspace
@@ -38,6 +52,10 @@ recalled with either `search "agent server learnings"` or `search "learnings age
 Hyphenated tag segments also contribute word aliases (`agent-server` -> `agent`, `server`).
 Results still show only the full canonical tag.
 
+Default `search` and `list` output is a compact routing list: use its printed base plus
+relative path to read the authoritative Markdown. Add `--json` for minified structured
+rows or `--json --verbose` for complete search diagnostics.
+
 Multiple explicit `--tag` filters are ANDed. Tags classify knowledge; project visibility
 still comes only from settings scopes.
 
@@ -52,3 +70,9 @@ agent-memory list --path /abs/path/to/agent-server --tag learnings:agent-server
 A stored tag such as `agent-server:learnings` is displayed in full even when the query is
 reversed or uses only the `learnings` segment. Tag order is a classification convention,
 not a recall requirement.
+
+If a targeted search returns no matches, its navigation/count/tags are still useful
+output. Execute the most relevant suggested next command in the same scope. Only after
+the brief, expanded context, and one evidence-based alternative query fail should the
+agent report that the currently visible scope has no relevant memory and continue the
+task.
