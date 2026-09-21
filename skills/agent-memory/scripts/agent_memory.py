@@ -44,6 +44,35 @@ READ_ONLY_DB_COMMANDS = {
 }
 
 
+def _sqlite_base_error_code(error: sqlite3.Error):
+    code = getattr(error, "sqlite_errorcode", None)
+    return None if code is None else code & 0xFF
+
+
+def _database_error_message(error: Exception, db: Path | None) -> str:
+    corrupt = False
+    if isinstance(error, sqlite3.Error):
+        if hasattr(error, "sqlite_errorcode"):
+            corrupt = _sqlite_base_error_code(error) in {
+                sqlite3.SQLITE_CORRUPT,
+                sqlite3.SQLITE_NOTADB,
+            }
+        else:
+            corrupt = str(error).casefold() in {
+                "database disk image is malformed",
+                "file is not a database",
+            }
+    if not corrupt or db is None:
+        return str(error)
+
+    db = db.expanduser().resolve(strict=False)
+    return (
+        f"database is corrupt or invalid: {db} ({error}). Stop all writers; "
+        f"move {db}, {db}-wal, and {db}-shm together into a quarantine "
+        "directory, then run: agent-memory sync. No files were moved."
+    )
+
+
 def _readonly_connection(db: Path):
     connection, used_immutable = connect_db_readonly(db)
     if used_immutable:
@@ -336,7 +365,7 @@ def main(argv=None):
             _emit(r, "doctor", a.output_format)
             return 2 if r["status"] == "error" else 1 if r["status"] == "warn" else 0
         except Exception as e:
-            r = _fail("doctor_failed", str(e), db)
+            r = _fail("doctor_failed", _database_error_message(e, db), db)
             _emit(r, "doctor", a.output_format)
             return 2
     if a.command == "snapshot":
@@ -367,6 +396,7 @@ def main(argv=None):
         except (MemoryError, OSError, sqlite3.Error) as e:
             print(f"agent-memory: {e}", file=sys.stderr)
             return 2
+    db: Path | None = None
     try:
         settings = load_settings(sp)
         db = database_path(settings, sp)
@@ -456,7 +486,7 @@ def main(argv=None):
         c.close()
         return 0
     except (MemoryError, OSError, sqlite3.Error) as e:
-        print(f"agent-memory: {e}", file=sys.stderr)
+        print(f"agent-memory: {_database_error_message(e, db)}", file=sys.stderr)
         return 2
 
 

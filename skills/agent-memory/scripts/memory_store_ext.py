@@ -1,7 +1,7 @@
 """Roadmap extensions layered over the file-first memory_store without replacing its MVE schema."""
 
 from __future__ import annotations
-import re, sqlite3
+import re, sqlite3, sys
 from pathlib import Path
 from typing import Any, Iterable
 import memory_store as base
@@ -21,6 +21,31 @@ REQUIRED_SCHEMA = {
 MEM_LINK_RE = re.compile(
     r"(?<!!)\[([^\]]*)\]\(memory://(mem_[A-Za-z0-9_-]+)(?:#([^)]+))?\)"
 )
+
+
+def _readonly_open_error(error: sqlite3.OperationalError) -> bool:
+    """Return whether a normal read-only open may safely try immutable mode."""
+    if hasattr(error, "sqlite_errorcode"):
+        code = error.sqlite_errorcode
+        return code is not None and code & 0xFF in {
+            sqlite3.SQLITE_CANTOPEN,
+            sqlite3.SQLITE_READONLY,
+        }
+
+    # Python 3.10 does not expose sqlite_errorcode. Keep this compatibility
+    # list deliberately narrow so corruption and unknown I/O failures surface.
+    return str(error).casefold() in {
+        "unable to open database file",
+        "attempt to write a readonly database",
+        "database is read-only",
+    }
+
+
+def _wal_has_content(path: Path) -> bool:
+    try:
+        return path.stat().st_size > 0
+    except FileNotFoundError:
+        return False
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -63,16 +88,21 @@ def connect_db_readonly(path: Path) -> tuple[sqlite3.Connection, bool]:
     try:
         conn = open_uri(immutable=False)
     except sqlite3.OperationalError as error:
-        if "unable to open database file" not in str(error).casefold():
+        if not _readonly_open_error(error):
             raise
         wal_path = Path(f"{path}-wal")
-        if wal_path.is_file() and wal_path.stat().st_size > 0:
+        if _wal_has_content(wal_path):
             raise MemoryError(
                 "read-only index has uncheckpointed WAL data; "
                 "run: agent-memory sync in a writable environment"
             ) from error
         conn = open_uri(immutable=True)
-        if wal_path.is_file() and wal_path.stat().st_size > 0:
+        try:
+            wal_changed = _wal_has_content(wal_path)
+        except Exception:
+            conn.close()
+            raise
+        if wal_changed:
             conn.close()
             raise MemoryError(
                 "read-only index changed while opening; "
@@ -159,14 +189,18 @@ def _enrich(c, item):
 
 
 def search_documents(c, query, project=None, tags=(), limit=10, include_shared=True):
-    terms = [x.casefold() for x in base._fts_terms(query)]
-    strict = base.search_documents(c, query, project, tags, limit, include_shared)
-    if strict:
-        for x in strict:
-            x.update(match_mode="strict", matched_terms=terms, missing_terms=[])
-            _enrich(c, x)
-        return strict
-    return []
+    if base.han_bigrams((query,)) and not base._cjk_index_is_current(c):
+        print(
+            "agent-memory: warning: Han auxiliary index is missing or outdated; "
+            "run: agent-memory sync",
+            file=sys.stderr,
+        )
+    return [
+        _enrich(c, item)
+        for item in base.search_documents(
+            c, query, project, tags, limit, include_shared
+        )
+    ]
 
 
 def list_documents(c, project=None, tags=(), limit=100, include_shared=True):

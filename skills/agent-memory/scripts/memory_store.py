@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 
+from memory_cjk import (
+    CJK_INDEX_NAME,
+    CJK_INDEX_VERSION,
+    han_bigrams,
+    han_runs,
+)
 from memory_config import (
     MemoryError,
     MemoryRoot,
@@ -21,6 +27,58 @@ from memory_config import (
 
 MD_LINK_RE = re.compile(r"(?<!!)\[([^\]]*)\]\(([^)]+)\)")
 WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]")
+
+# Deliberately small and conventional: these words add little discrimination to a
+# natural-language OR fallback.  This is only consulted after the unchanged AND
+# route is empty, and only plain alphabetic words are eligible.
+NATURAL_LANGUAGE_STOPWORDS = frozenset(
+    {
+        "a",
+        "after",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "before",
+        "because",
+        "been",
+        "being",
+        "but",
+        "by",
+        "can",
+        "could",
+        "do",
+        "does",
+        "during",
+        "for",
+        "from",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "may",
+        "might",
+        "must",
+        "of",
+        "on",
+        "or",
+        "shall",
+        "should",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "why",
+        "will",
+        "with",
+        "would",
+    }
+)
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -66,7 +124,37 @@ def connect_db(path: Path) -> sqlite3.Connection:
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(title, brief, content)"
     )
+    _ensure_cjk_schema(conn)
     return conn
+
+
+def _ensure_cjk_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS derived_indexes (name TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS document_cjk_fts USING fts5(grams)"
+    )
+
+
+def _cjk_index_is_current(conn: sqlite3.Connection) -> bool:
+    """Inspect derived state without attempting schema creation or repair."""
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view') "
+                "AND name IN ('derived_indexes','document_cjk_fts')"
+            )
+        }
+        if tables != {"derived_indexes", "document_cjk_fts"}:
+            return False
+        row = conn.execute(
+            "SELECT version FROM derived_indexes WHERE name=?", (CJK_INDEX_NAME,)
+        ).fetchone()
+        return row is not None and int(row[0]) == CJK_INDEX_VERSION
+    except sqlite3.DatabaseError:
+        return False
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -232,6 +320,9 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
     seen_paths: set[str] = set()
     indexed = 0
     with conn:
+        _ensure_cjk_schema(conn)
+        if not _cjk_index_is_current(conn):
+            conn.execute("DELETE FROM document_cjk_fts")
         for path, visibility in aggregated.items():
             text = path.read_text(encoding="utf-8", errors="replace")
             stat = path.stat()
@@ -249,6 +340,7 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
                     (title, brief, stat.st_mtime_ns, stat.st_size, digest, doc_id),
                 )
                 conn.execute("DELETE FROM document_fts WHERE rowid=?", (doc_id,))
+                conn.execute("DELETE FROM document_cjk_fts WHERE rowid=?", (doc_id,))
             else:
                 cur = conn.execute(
                     "INSERT INTO documents(path,title,brief,mtime_ns,size,sha256) VALUES(?,?,?,?,?,?)",
@@ -261,6 +353,12 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
                 "INSERT INTO document_fts(rowid,title,brief,content) VALUES(?,?,?,?)",
                 (doc_id, title, brief, indexed_content),
             )
+            cjk_grams = han_bigrams((title, brief, body))
+            if cjk_grams:
+                conn.execute(
+                    "INSERT INTO document_cjk_fts(rowid,grams) VALUES(?,?)",
+                    (doc_id, " ".join(cjk_grams)),
+                )
             conn.execute("DELETE FROM document_scopes WHERE document_id=?", (doc_id,))
             conn.executemany(
                 "INSERT INTO document_scopes(document_id,scope) VALUES(?,?)",
@@ -292,10 +390,16 @@ def sync_index(conn: sqlite3.Connection, roots: list[MemoryRoot]) -> dict[str, i
         ]
         for doc_id in stale:
             conn.execute("DELETE FROM document_fts WHERE rowid=?", (doc_id,))
+            conn.execute("DELETE FROM document_cjk_fts WHERE rowid=?", (doc_id,))
             conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
 
         conn.execute(
             "UPDATE links SET target_document_id=(SELECT id FROM documents d WHERE d.path=links.target_path)"
+        )
+        conn.execute(
+            "INSERT INTO derived_indexes(name,version) VALUES(?,?) "
+            "ON CONFLICT(name) DO UPDATE SET version=excluded.version",
+            (CJK_INDEX_NAME, CJK_INDEX_VERSION),
         )
 
     return {
@@ -314,10 +418,85 @@ def _fts_terms(text: str) -> list[str]:
 
 
 def _fts_query(text: str, operator: str = "AND") -> str:
-    terms = _fts_terms(text)
+    return _fts_query_terms(_fts_terms(text), operator)
+
+
+def _fts_query_terms(terms: Iterable[str], operator: str = "AND") -> str:
+    terms = list(terms)
     if operator not in {"AND", "OR"}:
         raise ValueError(f"unsupported FTS operator: {operator}")
     return f" {operator} ".join('"' + term.replace('"', '""') + '"' for term in terms)
+
+
+def _diagnostic_terms(query: str) -> list[str]:
+    """Return original query terms in order, with case-insensitive duplicates removed."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for term in _fts_terms(query):
+        folded = term.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            result.append(term)
+    return result
+
+
+def _fallback_terms(terms: Iterable[str]) -> list[str]:
+    original = list(terms)
+    useful = [
+        term
+        for term in original
+        if not (
+            term.isascii()
+            and term.isalpha()
+            and term.islower()
+            and term in NATURAL_LANGUAGE_STOPWORDS
+        )
+    ]
+    return useful or original
+
+
+def _word_term_matches(conn: sqlite3.Connection, doc_id: int, term: str) -> bool:
+    """Ask FTS whether one diagnostic term matched; do not approximate with substrings."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM document_fts WHERE rowid=? AND document_fts MATCH ?",
+            (doc_id, _fts_query_terms([term])),
+        ).fetchone()
+        is not None
+    )
+
+
+def _add_word_diagnostics(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    terms: list[str],
+    mode: str,
+    route_terms: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    if mode == "strict":
+        matched = list(terms)
+    else:
+        eligible = {
+            term.casefold() for term in (route_terms if route_terms is not None else terms)
+        }
+        matched = [
+            term
+            for term in terms
+            if term.casefold() in eligible
+            and _word_term_matches(conn, payload["id"], term)
+        ]
+    matched_folded = {term.casefold() for term in matched}
+    payload.update(
+        {
+            "match_mode": mode,
+            "matched_terms": matched,
+            "missing_terms": [
+                term for term in terms if term.casefold() not in matched_folded
+            ],
+            "retrieval_routes": ["word"],
+        }
+    )
+    return payload
 
 
 def _append_tag_filter(sql: str, params: list[Any], tag: str) -> str:
@@ -371,6 +550,181 @@ def _doc_payload(
     return payload
 
 
+def _scope_and_tag_filters(
+    sql: str,
+    params: list[Any],
+    project: str | None,
+    tags: tuple[str, ...],
+    include_shared: bool,
+) -> str:
+    if project:
+        scopes = [project] + ([SHARED_SCOPE] if include_shared else [])
+        placeholders = ",".join("?" for _ in scopes)
+        sql += (
+            " AND EXISTS (SELECT 1 FROM document_scopes s "
+            f"WHERE s.document_id=d.id AND s.scope IN ({placeholders}))"
+        )
+        params.extend(scopes)
+    for tag in tags:
+        sql = _append_tag_filter(sql, params, tag)
+    return sql
+
+
+def _original_indexed_fields(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> tuple[str, str, str]:
+    tag_text = _tag_search_text(
+        r[0]
+        for r in conn.execute(
+            "SELECT tag FROM document_tags WHERE document_id=? ORDER BY tag",
+            (int(row["id"]),),
+        )
+    )
+    suffix = "\n\n" + tag_text
+    content = str(row["indexed_content"])
+    body = content[: -len(suffix)] if content.endswith(suffix) else content
+    return str(row["title"]), str(row["brief"]), body
+
+
+def _cjk_term_matches(conn: sqlite3.Connection, row: sqlite3.Row, term: str) -> bool:
+    return any(term in field for field in _original_indexed_fields(conn, row))
+
+
+def _cjk_candidates(
+    conn: sqlite3.Connection,
+    grams: list[str],
+    runs: list[str],
+    project: str | None,
+    tags: tuple[str, ...],
+    include_shared: bool,
+    candidate_limit: int,
+) -> list[dict[str, Any]]:
+    if not grams or not _cjk_index_is_current(conn):
+        return []
+
+    def execute(operator: str, result_limit: int | None) -> list[sqlite3.Row]:
+        sql = """
+            SELECT d.id,d.path,d.title,d.brief,
+                   document_fts.content AS indexed_content,
+                   document_cjk_fts.grams AS indexed_grams,
+                   bm25(document_cjk_fts) AS score
+            FROM document_cjk_fts
+            JOIN documents d ON d.id=document_cjk_fts.rowid
+            JOIN document_fts ON document_fts.rowid=d.id
+            WHERE document_cjk_fts MATCH ?
+        """
+        params: list[Any] = [_fts_query_terms(grams, operator)]
+        sql = _scope_and_tag_filters(sql, params, project, tags, include_shared)
+        sql += " ORDER BY score,d.path"
+        if result_limit is not None:
+            sql += " LIMIT ?"
+            params.append(result_limit)
+        return list(conn.execute(sql, params))
+
+    full_hits: list[dict[str, Any]] = []
+    for row in execute("AND", candidate_limit):
+        if all(_cjk_term_matches(conn, row, run) for run in runs):
+            full_hits.append(
+                {
+                    "row": row,
+                    "score": float(row["score"]),
+                    "matched_grams": list(grams),
+                    "coverage": 1.0,
+                    "full": True,
+                }
+            )
+    if full_hits:
+        return full_hits
+
+    # A two-character query has one gram and is admitted only through the full
+    # contiguous check above.  Longer queries may use the explicitly relaxed route.
+    if len(grams) == 1:
+        return []
+    query_grams = set(grams)
+    relaxed: list[dict[str, Any]] = []
+    for row in execute("OR", None):
+        matched = [gram for gram in grams if gram in set(row["indexed_grams"].split())]
+        if len(matched) < 2 or len(matched) * 2 < len(grams):
+            continue
+        relaxed.append(
+            {
+                "row": row,
+                "score": float(row["score"]),
+                "matched_grams": matched,
+                "coverage": len(set(matched) & query_grams) / len(query_grams),
+                "full": False,
+            }
+        )
+    relaxed.sort(
+        key=lambda item: (
+            -len(item["matched_grams"]),
+            item["score"],
+            item["row"]["path"],
+        )
+    )
+    return relaxed[:candidate_limit]
+
+
+def _fused_payload(
+    conn: sqlite3.Connection,
+    query_terms: list[str],
+    word: dict[str, Any] | None,
+    cjk: dict[str, Any] | None,
+    rank_score: float,
+) -> dict[str, Any]:
+    chosen = word or cjk
+    assert chosen is not None
+    row = chosen["row"]
+    score = float(word["score"] if word is not None else cjk["score"])
+    payload = _doc_payload(conn, row, score)
+
+    matched: list[str] = []
+    word_mode = word["mode"] if word is not None else None
+    for term in query_terms:
+        word_match = word is not None and (
+            word_mode == "strict"
+            or (
+                term.casefold() in word["route_terms"]
+                and _word_term_matches(conn, payload["id"], term)
+            )
+        )
+        cjk_match = (
+            cjk is not None
+            and bool(han_runs(term))
+            and _cjk_term_matches(conn, row, term)
+        )
+        if word_match or cjk_match:
+            matched.append(term)
+    matched_folded = {term.casefold() for term in matched}
+
+    routes = (["word"] if word is not None else []) + (
+        ["cjk"] if cjk is not None else []
+    )
+    if cjk is not None and not cjk["full"]:
+        mode = "relaxed"
+    elif word is not None and cjk is not None:
+        mode = "hybrid"
+    elif cjk is not None:
+        mode = "cjk"
+    else:
+        mode = str(word_mode)
+    payload.update(
+        {
+            "match_mode": mode,
+            "matched_terms": matched,
+            "missing_terms": [
+                term for term in query_terms if term.casefold() not in matched_folded
+            ],
+            "retrieval_routes": routes,
+            "rank_score": rank_score,
+        }
+    )
+    if cjk is not None:
+        payload["matched_grams"] = list(cjk["matched_grams"])
+        payload["gram_coverage"] = float(cjk["coverage"])
+    return payload
+
+
 def search_documents(
     conn: sqlite3.Connection,
     query: str,
@@ -380,8 +734,11 @@ def search_documents(
     include_shared: bool = True,
 ) -> list[dict[str, Any]]:
     tags = tuple(tags)
+    diagnostic_terms = _diagnostic_terms(query)
 
-    def execute(match_query: str, result_limit: int) -> list[sqlite3.Row]:
+    def execute(
+        match_query: str, result_limit: int, stable_ties: bool = False
+    ) -> list[sqlite3.Row]:
         sql = """
             SELECT d.id,d.path,d.title,d.brief,document_fts.content AS indexed_content,
                    bm25(document_fts) AS score
@@ -389,36 +746,130 @@ def search_documents(
             WHERE document_fts MATCH ?
         """
         params: list[Any] = [match_query]
-        if project:
-            scopes = [project] + ([SHARED_SCOPE] if include_shared else [])
-            placeholders = ",".join("?" for _ in scopes)
-            sql += f" AND EXISTS (SELECT 1 FROM document_scopes s WHERE s.document_id=d.id AND s.scope IN ({placeholders}))"
-            params.extend(scopes)
-        for tag in tags:
-            sql = _append_tag_filter(sql, params, tag)
-        sql += " ORDER BY score LIMIT ?"
+        sql = _scope_and_tag_filters(sql, params, project, tags, include_shared)
+        sql += " ORDER BY score" + (",d.path" if stable_ties else "") + " LIMIT ?"
         params.append(result_limit)
         return list(conn.execute(sql, params))
 
-    strict_hits = execute(_fts_query(query), limit)
+    query_runs = han_runs(query)
+    if not query_runs:
+        strict_hits = execute(_fts_query(query), limit)
+    else:
+        strict_hits = []
     if strict_hits:
-        return [_doc_payload(conn, row, float(row["score"])) for row in strict_hits]
+        return [
+            _add_word_diagnostics(
+                conn,
+                _doc_payload(conn, row, float(row["score"])),
+                diagnostic_terms,
+                "strict",
+            )
+            for row in strict_hits
+        ]
 
     # Natural-language recall often contains an extra symptom or synonym that is
     # absent from a concise memory. Preserve precise AND results when they exist,
     # but make a no-result query useful by recalling documents that match any term.
-    # A concise memory matching several symptoms should rank above a large general
-    # workflow that happens to repeat one common word, then BM25 breaks ties.
-    terms = [term.casefold() for term in _fts_terms(query)]
-    fallback_hits = execute(_fts_query(query, "OR"), max(limit * 20, 100))
-    fallback_hits.sort(
-        key=lambda row: (
-            -sum(term in row["indexed_content"].casefold() for term in terms),
-            float(row["score"]),
+    # Deduplicate and remove only a small set of plain-language stopwords, then let
+    # equal-weight FTS5 BM25 rank every indexed field.  If all terms are stopwords,
+    # retain the original terms so the query remains searchable.
+    fallback_terms = _fallback_terms(diagnostic_terms)
+    if query_runs:
+        candidate_limit = max(limit * 20, 100)
+        word_hits = execute(_fts_query(query), candidate_limit, True)
+        word_mode = "strict"
+        if not word_hits:
+            word_hits = execute(
+                _fts_query_terms(fallback_terms, "OR"), candidate_limit, True
+            )
+            word_mode = "relaxed"
+
+        query_grams = han_bigrams((query,))
+        cjk_hits = _cjk_candidates(
+            conn,
+            query_grams,
+            query_runs,
+            project,
+            tags,
+            include_shared,
+            candidate_limit,
         )
+        if not _cjk_index_is_current(conn):
+            # Old/read-only indexes retain their established word-only behavior.
+            if word_mode == "relaxed":
+                folded_terms = [term.casefold() for term in diagnostic_terms]
+                word_hits.sort(
+                    key=lambda row: (
+                        -sum(
+                            term in row["indexed_content"].casefold()
+                            for term in folded_terms
+                        ),
+                        float(row["score"]),
+                    )
+                )
+            return [
+                _add_word_diagnostics(
+                    conn,
+                    _doc_payload(conn, row, float(row["score"])),
+                    diagnostic_terms,
+                    word_mode,
+                    fallback_terms if word_mode == "relaxed" else diagnostic_terms,
+                )
+                for row in word_hits[:limit]
+            ]
+
+        word_ranked = {
+            int(row["id"]): {
+                "row": row,
+                "score": float(row["score"]),
+                "mode": word_mode,
+                "route_terms": {
+                    term.casefold()
+                    for term in (
+                        fallback_terms if word_mode == "relaxed" else diagnostic_terms
+                    )
+                },
+                "rank": rank,
+            }
+            for rank, row in enumerate(word_hits, 1)
+        }
+        cjk_ranked = {
+            int(item["row"]["id"]): {**item, "rank": rank}
+            for rank, item in enumerate(cjk_hits, 1)
+        }
+        fused: list[tuple[float, str, int]] = []
+        for doc_id in word_ranked.keys() | cjk_ranked.keys():
+            rank_score = 0.0
+            if doc_id in word_ranked:
+                rank_score += 1.0 / (60 + word_ranked[doc_id]["rank"])
+            if doc_id in cjk_ranked:
+                rank_score += 1.0 / (60 + cjk_ranked[doc_id]["rank"])
+            source = word_ranked.get(doc_id) or cjk_ranked[doc_id]
+            fused.append((rank_score, str(source["row"]["path"]), doc_id))
+        fused.sort(key=lambda item: (-item[0], item[1]))
+        return [
+            _fused_payload(
+                conn,
+                diagnostic_terms,
+                word_ranked.get(doc_id),
+                cjk_ranked.get(doc_id),
+                rank_score,
+            )
+            for rank_score, _, doc_id in fused[:limit]
+        ]
+
+    fallback_hits = execute(
+        _fts_query_terms(fallback_terms, "OR"), max(limit * 20, 100)
     )
     return [
-        _doc_payload(conn, row, float(row["score"])) for row in fallback_hits[:limit]
+        _add_word_diagnostics(
+            conn,
+            _doc_payload(conn, row, float(row["score"])),
+            diagnostic_terms,
+            "relaxed",
+            fallback_terms,
+        )
+        for row in fallback_hits[:limit]
     ]
 
 

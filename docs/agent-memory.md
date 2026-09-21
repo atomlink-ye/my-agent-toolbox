@@ -68,9 +68,56 @@ answers: *which durable files are relevant, where are they, and how are they rel
 The Markdown files do not need to live under `~/.agent-memory/`; they may live anywhere
 on the local filesystem. The settings file only records where to find them.
 
+## Runtime and first bootstrap
+
+Agent Memory requires Python 3.10 or newer, the standard-library `sqlite3` module with
+FTS5 enabled, and the complete `skills/agent-memory/scripts/` directory. It has no
+third-party Python package, daemon, network, Node, or pnpm runtime dependency. A repository
+global link may use pnpm, but a standalone skill copy runs directly through Python.
+
+Start from the absolute directory containing the `SKILL.md` that the current runtime
+actually loaded. Do not derive it from the calling CWD:
+
+```bash
+AM_SKILL_DIR=/absolute/path/to/loaded/agent-memory
+if ! test -f "$AM_SKILL_DIR/SKILL.md" || \
+   ! test -f "$AM_SKILL_DIR/scripts/agent_memory.py"; then
+  printf '%s\n' "invalid agent-memory skill directory: $AM_SKILL_DIR" >&2
+  exit 2
+fi
+if command -v agent-memory >/dev/null 2>&1; then
+  AM=(agent-memory)
+else
+  AM=(python3 "$AM_SKILL_DIR/scripts/agent_memory.py")
+fi
+```
+
+Use `"${AM[@]}"` in place of a bare `agent-memory` in the examples below. A Codex
+standalone copy supplies its installed skill directory; it does not automatically put a
+CLI on PATH. In Claude Code plugin content only,
+`AM_SKILL_DIR="${CLAUDE_PLUGIN_ROOT}/skills/agent-memory"` is the documented convenience
+substitution. That Claude integration has not been end-to-end verified in this
+repository's test environment; `${CLAUDE_PLUGIN_ROOT}` is not a normal Bash variable.
+
+Check `"${AM[@]}" --json status` first. A fresh bootstrap is two distinct mutations:
+
+```bash
+"${AM[@]}" --json init
+"${AM[@]}" --json sync
+"${AM[@]}" --json status
+```
+
+All three exit `0` on success. `init` creates only settings; `sync` creates/rebuilds the
+derived index. If status reports only `index not initialized`, keep the existing settings
+and run only `sync`. For malformed settings, corruption, or other I/O errors, stop and
+diagnose instead of using `init --force`.
+
 ## Settings
 
 Default path: `~/.agent-memory/settings.json`.
+
+An explicit global `--settings` option has highest priority, followed by
+`AGENT_MEMORY_SETTINGS`, then `$AGENT_MEMORY_HOME/settings.json`, then the default above.
 
 ```json
 {
@@ -143,6 +190,12 @@ falls back to global scope; invalid settings and equally-specific containing bin
 fail. `resolve`, `capture`, and `doctor --path` remain strict and fail rather than guessing
 a project or capture root. `capture --project <name>` is an explicit alternative to
 `--path`, only when that name identifies exactly one binding; duplicate names are rejected.
+
+This asymmetry is important: a mistyped/unbound search `--path` can silently broaden the
+query to global scope, while capture is strict. A wrong but valid path can therefore expose
+unintended search results; a wrong capture target can select the wrong binding and misfile
+the new Markdown. Verify capture routing with `resolve --path /actual/project/path` or
+`doctor --path /actual/project/path` rather than substituting the agent's launch CWD.
 
 This makes the common multi-project workspace safe by default:
 
@@ -337,7 +390,7 @@ file.
 
 ## CLI
 
-The implementation is stdlib-only Python 3 plus SQLite/FTS5.
+The implementation is standard-library-only Python 3.10+ plus SQLite/FTS5.
 
 Every subcommand except `browse` emits deterministic YAML by default, including `init` and
 `doctor`. `browse` defaults to human-readable grouped text.
@@ -356,8 +409,9 @@ agent-memory --json browse --project agent-server
 ```
 
 ```sh
-# bootstrap
-agent-memory init
+# bootstrap (init alone is not ready)
+agent-memory --json init
+agent-memory --json sync
 
 # verify paths / counts
 agent-memory --json status
@@ -387,7 +441,46 @@ agent-memory --json snapshot inspect ~/backups/agent-memory/agent-memory-2026082
 ```
 
 The global `--settings PATH` option supports alternate registries and tests. The
-`AGENT_MEMORY_SETTINGS` environment variable can set the same default.
+`AGENT_MEMORY_SETTINGS` and `AGENT_MEMORY_HOME` variables can set the defaults as described
+above.
+
+After a default `init` and `sync`, status and doctor can be healthy while the registry is
+empty. Its settings contain no binding or memory root, so capture has nowhere to write.
+Add a binding and at least one writable `memory` root using the Settings schema above;
+mark one root with `"capture": true` when several roots could receive captures. Run
+`sync`, then verify the actual worktree with `resolve --path` or `doctor --path`. Agent
+Memory intentionally provides no interactive setup wizard. A capture `--root` must exactly
+match one configured root after path expansion/resolution.
+
+## Search language boundary
+
+The current word index uses SQLite FTS5 `unicode61`, which can index a contiguous Han run
+as one token. Splitting a Chinese query with spaces does not split the text already in the
+index and is not a general workaround. Until a runtime with the auxiliary Han substring
+route is installed and an explicit `sync` has populated its derived table, use a known
+ASCII anchor when available and treat zero results as inconclusive. The auxiliary route is
+intended for Han substring recall; it is not Chinese word segmentation, paraphrase, or
+semantic search.
+
+## Doctor exit codes
+
+Doctor is read-only and returns `0` for ok, `1` for warnings, and `2` for errors. Do not
+write `doctor && search`: both warnings and errors short-circuit the search. Warnings may
+identify stale/unindexed Markdown, missing roots, dangling links, or ambiguous capture
+routing, so inspect them rather than treating every warning as harmless. If a search is
+still intended, run it as a separate command after explicitly handling the doctor code.
+
+Read commands open SQLite read-only and do not run schema-creating DDL. A safe immutable
+fallback may be used for a cold read-only database only when no non-empty WAL can be lost;
+the CLI reports that fallback on stderr. Unsafe WAL, other I/O failures, and corruption
+remain errors.
+
+For corruption recovery, locate the configured database, stop all writers, and move the
+main database plus any matching `-wal` and `-shm` sidecars together to a recoverable
+quarantine. Then run an explicit `sync` to rebuild the disposable index from Markdown.
+Never delete only one member of the SQLite file set, combine files from different points
+in time, or overwrite settings with `init --force`; `sync` is a rebuild after quarantine,
+not an in-place database repair.
 
 ## Snapshots
 
