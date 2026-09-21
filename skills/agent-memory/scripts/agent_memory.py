@@ -22,6 +22,7 @@ from memory_config import (
 )
 from memory_context import resolve_context
 from memory_format import (
+    CONTEXT_OUTPUT_BUDGET,
     OUTPUT_BUDGET,
     bounded_json,
     bounded_navigation_text,
@@ -30,7 +31,7 @@ from memory_format import (
     yaml_dump,
 )
 from memory_navigation import navigation_inventory
-from memory_lifecycle import update_lifecycle
+from memory_lifecycle import update_lifecycle, update_tier
 from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 from memory_store_ext import (
     connect_db,
@@ -371,8 +372,9 @@ def build_parser():
     q.add_argument("--allow-duplicate", action="store_true")
     q = sub("lifecycle", "change lifecycle")
     q.add_argument("document")
-    q.add_argument("status", choices=sorted(LIFECYCLE_STATES))
+    q.add_argument("status", nargs="?", choices=sorted(LIFECYCLE_STATES))
     q.add_argument("--target")
+    q.add_argument("--tier", choices=("core", "archive"))
     sub("projects", "list projects")
     q = sub("tags", "list tags")
     q.add_argument("--project")
@@ -386,7 +388,7 @@ def build_parser():
     q.add_argument("--no-shared", action="store_true")
     q = sub("brief", "show a bounded opening inventory for the current project")
     q.add_argument("--path", type=Path)
-    q = sub("context", "expand the bounded project memory inventory")
+    q = sub("context", "show the expanded all-tier memory inventory")
     target = q.add_mutually_exclusive_group()
     target.add_argument("--path", type=Path)
     target.add_argument("--project")
@@ -483,6 +485,7 @@ def _navigation_payload(
     tag_limit=5,
     query=None,
     context_terms=(),
+    core_only=False,
 ):
     registered = context["status"] == "resolved"
     inventory = navigation_inventory(
@@ -494,6 +497,7 @@ def _navigation_payload(
         project_limit=project_limit,
         tag_limit=tag_limit,
         context_terms=context_terms,
+        tier_filter="core" if core_only else None,
     )
     state = status_name
     if not registered and status_name != "no_match":
@@ -504,6 +508,63 @@ def _navigation_payload(
     next_command = _scope_command("context", context, tags, include_shared)
     if tags:
         next_command = _scope_command("list", context, tags, include_shared) + " --limit 5"
+    tier_guidance = None
+    next_commands = [
+        next_command
+        if registered
+        else context.get("registration_command") or "agent-memory projects"
+    ]
+    if core_only and inventory["counts"]["core"] == 0:
+        context_command = _scope_command("context", context, tags, include_shared)
+        archive_inventory = navigation_inventory(
+            conn,
+            project=context["project"] if registered else None,
+            tags=tags,
+            include_shared=include_shared,
+            global_limit=1,
+            project_limit=1,
+            tag_limit=0,
+            tier_filter="archive",
+        )
+        archive_candidates = [
+            *archive_inventory["project"],
+            *archive_inventory["global"],
+        ]
+        if archive_candidates:
+            candidate_id = archive_candidates[0]["id"]
+            lifecycle_command = f"agent-memory lifecycle {candidate_id} --tier core"
+            if registered:
+                tier_guidance = (
+                    "Core tier is empty; context shows archive notes. Review one and set a useful note to core by ID."
+                )
+                next_commands = [context_command, lifecycle_command]
+            else:
+                tier_guidance = (
+                    "Core tier is empty in this unregistered scope. Register the project, review context, "
+                    "and set a useful shared note to core by ID."
+                )
+                next_commands = [
+                    context.get("registration_command") or "agent-memory projects",
+                    context_command,
+                    lifecycle_command,
+                ]
+        else:
+            if registered:
+                tier_guidance = (
+                    "Core tier is empty and no notes are visible. Capture a durable note; "
+                    "use its returned ID with lifecycle --tier core if it should be in brief."
+                )
+                capture_command = "agent-memory capture learning 'Reusable rule' --project " + shlex.quote(context["project"])
+                next_commands = [context_command, capture_command]
+            else:
+                tier_guidance = (
+                    "This scope is unregistered and has no visible notes. Register the project, "
+                    "then capture a durable note to populate its memory."
+                )
+                next_commands = [
+                    context.get("registration_command") or "agent-memory projects",
+                    context_command,
+                ]
     return {
         "status": state,
         "project": context.get("project"),
@@ -526,7 +587,7 @@ def _navigation_payload(
         "diagnostics": [
             {"code": item.get("code", "unknown"), "severity": item.get("severity", "info")}
             for item in context.get("diagnostics", [])
-        ],
+        ] + inventory["diagnostics"],
         "diagnostic": next(
             (
                 item.get("message", "")
@@ -535,11 +596,8 @@ def _navigation_payload(
             ),
             None,
         ),
-        "next_commands": [
-            next_command
-            if registered
-            else context.get("registration_command") or "agent-memory projects"
-        ],
+        "tier_guidance": tier_guidance,
+        "next_commands": next_commands,
         "truncated": False,
     }
 
@@ -569,6 +627,11 @@ def main(argv=None):
     if len({x for x in raw if x in {"--compact", "--json", "--table", "--text", "--yaml", "--envelope"}}) > 1:
         p.error("output options are mutually exclusive")
     a = p.parse_args(raw)
+    if a.command == "lifecycle":
+        if (a.status is None) == (a.tier is None):
+            p.error("lifecycle requires exactly one status or --tier")
+        if a.tier is not None and a.target is not None:
+            p.error("--target only applies to lifecycle status transitions")
     if a.output_format == "compact" and a.command not in {"search", "list"}:
         p.error("--compact is only available for search and list")
     if a.output_format == "envelope" and a.command not in {"search", "brief", "context"}:
@@ -732,7 +795,11 @@ def main(argv=None):
                 else {}
             )
         elif a.command == "lifecycle":
-            r = update_lifecycle(c, a.document, a.status, target=a.target)
+            r = (
+                update_tier(c, a.document, a.tier)
+                if a.tier is not None
+                else update_lifecycle(c, a.document, a.status, target=a.target)
+            )
             r["sync"] = sync_index(c, collect_memory_roots(settings, sp))
         elif a.command == "projects":
             r = project_inventory(c, settings)
@@ -758,8 +825,13 @@ def main(argv=None):
                 project_limit=4 if a.command == "brief" else 15,
                 tag_limit=5 if a.command == "brief" else 10,
                 context_terms=(current_context_terms(a.path) if a.command == "brief" else ()),
+                core_only=a.command == "brief",
             )
-            _emit_bounded_payload(r, a.output_format)
+            _emit_bounded_payload(
+                r,
+                a.output_format,
+                CONTEXT_OUTPUT_BUDGET if a.command == "context" else OUTPUT_BUDGET,
+            )
             c.close()
             return 0
         roots = (

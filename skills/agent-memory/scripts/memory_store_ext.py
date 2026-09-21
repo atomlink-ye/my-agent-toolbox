@@ -51,8 +51,11 @@ def _wal_has_content(path: Path) -> bool:
 def connect_db(path: Path) -> sqlite3.Connection:
     c = base.connect_db(path)
     c.executescript(
-        """CREATE TABLE IF NOT EXISTS memory_meta(document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,memory_id TEXT,doc_type TEXT,lifecycle_status TEXT,promoted_to TEXT,superseded_by TEXT);CREATE INDEX IF NOT EXISTS idx_memory_meta_id ON memory_meta(memory_id);CREATE TABLE IF NOT EXISTS memory_links(source_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,target_memory_id TEXT NOT NULL,label TEXT NOT NULL,anchor TEXT,PRIMARY KEY(source_document_id,target_memory_id,label));CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_memory_id);"""
+        """CREATE TABLE IF NOT EXISTS memory_meta(document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,memory_id TEXT,doc_type TEXT,lifecycle_status TEXT,promoted_to TEXT,superseded_by TEXT,tier TEXT);CREATE INDEX IF NOT EXISTS idx_memory_meta_id ON memory_meta(memory_id);CREATE TABLE IF NOT EXISTS memory_links(source_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,target_memory_id TEXT NOT NULL,label TEXT NOT NULL,anchor TEXT,PRIMARY KEY(source_document_id,target_memory_id,label));CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_memory_id);"""
     )
+    columns = {row[1] for row in c.execute("PRAGMA table_info(memory_meta)")}
+    if "tier" not in columns:
+        c.execute("ALTER TABLE memory_meta ADD COLUMN tier TEXT")
     c.commit()
     return c
 
@@ -135,6 +138,7 @@ def _meta(path: Path):
         "status": str(m.get("status") or "").strip().lower() or None,
         "promoted_to": str(m.get("promoted_to") or "").strip() or None,
         "superseded_by": str(m.get("superseded_by") or "").strip() or None,
+        "tier": str(m.get("tier") or "").strip().lower() or None,
     }, body
 
 
@@ -149,7 +153,7 @@ def sync_index(c: sqlite3.Connection, roots: list[MemoryRoot]):
                 continue
             m, body = _meta(p)
             c.execute(
-                "INSERT INTO memory_meta(document_id,memory_id,doc_type,lifecycle_status,promoted_to,superseded_by) VALUES(?,?,?,?,?,?)",
+                "INSERT INTO memory_meta(document_id,memory_id,doc_type,lifecycle_status,promoted_to,superseded_by,tier) VALUES(?,?,?,?,?,?,?)",
                 (
                     row["id"],
                     m["id"],
@@ -157,6 +161,7 @@ def sync_index(c: sqlite3.Connection, roots: list[MemoryRoot]):
                     m["status"],
                     m["promoted_to"],
                     m["superseded_by"],
+                    m["tier"],
                 ),
             )
             for match in MEM_LINK_RE.finditer(body):
@@ -173,8 +178,10 @@ def sync_index(c: sqlite3.Connection, roots: list[MemoryRoot]):
 
 
 def _enrich(c, item):
+    columns = {row[1] for row in c.execute("PRAGMA table_info(memory_meta)")}
+    tier_select = ",tier" if "tier" in columns else ",NULL AS tier"
     row = c.execute(
-        "SELECT memory_id,doc_type,lifecycle_status,promoted_to,superseded_by FROM memory_meta WHERE document_id=?",
+        "SELECT memory_id,doc_type,lifecycle_status,promoted_to,superseded_by" + tier_select + " FROM memory_meta WHERE document_id=?",
         (item["id"],),
     ).fetchone()
     if row:
@@ -184,6 +191,7 @@ def _enrich(c, item):
             status=row[2],
             promoted_to=row[3],
             superseded_by=row[4],
+            tier=row[5],
         )
     return item
 

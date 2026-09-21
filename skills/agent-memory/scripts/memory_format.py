@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 OUTPUT_BUDGET = 2048
+CONTEXT_OUTPUT_BUDGET = 8192
 
 _PLAIN_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 _YAML_BOOL_OR_NULL = {"null", "true", "false", "yes", "no", "on", "off", "y", "n", "~"}
@@ -191,10 +192,13 @@ def navigation_text(payload: dict[str, Any]) -> str:
     lines = [" ".join(parts)]
     counts = payload.get("counts", {})
     lines.append(
-        "counts: distinct={} global={} project={} (components may overlap)".format(
+        "counts: distinct={} global={} project={} core={} archive={} defaulted={} (components may overlap)".format(
             counts.get("distinct", "unknown"),
             counts.get("global", "unknown"),
             counts.get("project", "unknown") if counts.get("project") is not None else "unknown",
+            counts.get("core", "unknown"),
+            counts.get("archive", "unknown"),
+            counts.get("defaulted", "unknown"),
         )
     )
     tags = payload.get("tags", [])
@@ -209,13 +213,18 @@ def navigation_text(payload: dict[str, Any]) -> str:
         lines.append("diagnostic: " + _safe_text(payload["diagnostic"]))
     diagnostics = payload.get("diagnostics", [])
     if diagnostics:
-        codes = [
-            _safe_text(item.get("code", "unknown"))
-            for item in diagnostics
-            if isinstance(item, dict)
-        ]
+        codes = []
+        for item in diagnostics:
+            if not isinstance(item, dict):
+                continue
+            code = _safe_text(item.get("code", "unknown"))
+            if item.get("count") is not None:
+                code += f"({item['count']})"
+            codes.append(code)
         if codes:
             lines.append("diagnostics: " + ", ".join(codes))
+    if payload.get("tier_guidance"):
+        lines.append("guidance: " + _safe_text(payload["tier_guidance"]))
     rows = payload.get("navigation", [])
     if rows:
         lines.append("navigation:")
@@ -235,7 +244,12 @@ def navigation_text(payload: dict[str, Any]) -> str:
     lines.append(f"omitted: {payload.get('omitted', 0)}")
     lines.append("note: navigation, not search hits")
     commands = payload.get("next_commands", [])
-    lines.append("next: " + _safe_text(commands[0] if commands else "agent-memory brief"))
+    next_step = (
+        "; then ".join(commands)
+        if payload.get("tier_guidance")
+        else (commands[0] if commands else "agent-memory brief")
+    )
+    lines.append("next: " + _safe_text(next_step))
     if payload.get("truncated"):
         lines.append("truncated: true")
     return "\n".join(lines)
@@ -266,6 +280,89 @@ def _prune_navigation_brief(payload: dict[str, Any]) -> bool:
     return True
 
 
+def _shorten_utf8(value: object, budget: int) -> str:
+    suffix = "…"
+    prefix_budget = max(0, budget - len(suffix.encode("utf-8")))
+    prefix = str(value).encode("utf-8")[:prefix_budget].decode("utf-8", "ignore")
+    return prefix + suffix
+
+
+def _prune_navigation_payload(payload: dict[str, Any]) -> bool:
+    if payload.get("tags"):
+        payload["tags"].pop()
+    elif payload.get("project_summaries"):
+        payload["project_summaries"].pop()
+    elif _prune_navigation_brief(payload):
+        pass
+    elif len(payload.get("navigation", [])) > 1:
+        payload["navigation"].pop()
+        _recount_omitted(payload)
+    elif len(str(payload.get("query", "")).encode("utf-8")) > 32:
+        payload["query"] = _shorten_utf8(payload["query"], 32)
+    elif payload.get("navigation"):
+        payload["navigation"].pop()
+        _recount_omitted(payload)
+    elif payload.get("configured_projects"):
+        payload["configured_projects"].pop()
+    elif len(str(payload.get("diagnostic", "")).encode("utf-8")) > 160:
+        payload["diagnostic"] = _shorten_utf8(payload["diagnostic"], 160)
+    elif payload.get("diagnostic"):
+        payload["diagnostic"] = None
+    elif len(str(payload.get("tier_guidance", "")).encode("utf-8")) > 160:
+        payload["tier_guidance"] = _shorten_utf8(payload["tier_guidance"], 160)
+    elif payload.get("tier_guidance"):
+        payload["tier_guidance"] = None
+    elif payload.get("diagnostics"):
+        payload["diagnostics"].pop()
+    elif any(
+        len(str(command).encode("utf-8")) > 256
+        for command in payload.get("next_commands", [])
+    ):
+        compacted = []
+        for command in payload.get("next_commands", []):
+            command = str(command)
+            if len(command.encode("utf-8")) > 256:
+                if command.startswith("agent-memory context"):
+                    command = "agent-memory context"
+                elif command.startswith("agent-memory register"):
+                    command = "agent-memory projects"
+                else:
+                    continue
+            if command not in compacted:
+                compacted.append(command)
+        payload["next_commands"] = compacted or ["agent-memory brief"]
+    elif len(str(payload.get("project", "")).encode("utf-8")) > 128 or len(
+        str(payload.get("scope", {}).get("project", "")).encode("utf-8")
+    ) > 128:
+        payload["project"] = None
+        payload.setdefault("scope", {})["project"] = None
+        payload["scope"]["identity_truncated"] = True
+    elif len(payload.get("next_commands", [])) > 2:
+        payload["next_commands"] = payload["next_commands"][:2]
+    else:
+        return False
+    payload["truncated"] = True
+    return True
+
+
+def _minimal_navigation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    counts = payload.get("counts", {})
+    return {
+        "status": payload.get("status", "unknown"),
+        "project": None,
+        "source": payload.get("source", "unknown"),
+        "scope": {"project": None, "source": payload.get("source", "unknown")},
+        "counts": {
+            key: counts.get(key, "unknown")
+            for key in ("distinct", "global", "project", "core", "archive", "defaulted")
+        },
+        "navigation": [],
+        "omitted": counts.get("distinct", "unknown"),
+        "next_commands": ["agent-memory brief"],
+        "truncated": True,
+    }
+
+
 def bounded_navigation_text(payload: dict[str, Any], budget: int = OUTPUT_BUDGET) -> str:
     """Prune optional navigation data until the UTF-8 packet fits."""
     item = copy.deepcopy(payload)
@@ -273,36 +370,11 @@ def bounded_navigation_text(payload: dict[str, Any], budget: int = OUTPUT_BUDGET
         rendered = navigation_text(item) + "\n"
         if len(rendered.encode("utf-8")) <= budget:
             return rendered
-        item["truncated"] = True
-        if item.get("tags"):
-            item["tags"].pop()
-        elif item.get("project_summaries"):
-            item["project_summaries"].pop()
-        elif _prune_navigation_brief(item):
-            pass
-        elif len(item.get("navigation", [])) > 1:
-            item["navigation"].pop()
-            _recount_omitted(item)
-        elif len(str(item.get("query", ""))) > 24:
-            item["query"] = _safe_text(item["query"])[:24] + "…"
-        elif item.get("navigation"):
-            item["navigation"].pop()
-            _recount_omitted(item)
-        elif item.get("configured_projects"):
-            item["configured_projects"].pop()
-        elif len(str(item.get("diagnostic", ""))) > 160:
-            item["diagnostic"] = _safe_text(item["diagnostic"])[:160] + "…"
-        else:
-            # The mandatory core is intentionally short.  This branch is only a
-            # last defense for a caller-provided microscopic budget.
-            core = "status={} scope={} count={} omitted={} next={}\n".format(
-                _safe_text(item.get("status", "unknown")),
-                "unknown",
-                item.get("counts", {}).get("distinct", "unknown"),
-                item.get("omitted", 0),
-                "agent-memory brief",
-            )
-            return core.encode("utf-8")[:budget].decode("utf-8", "ignore")
+        if not _prune_navigation_payload(item):
+            rendered = navigation_text(_minimal_navigation_payload(item)) + "\n"
+            if len(rendered.encode("utf-8")) <= budget:
+                return rendered
+            return "next: agent-memory brief\n"[:budget]
 
 
 def bounded_json(payload: dict[str, Any], budget: int = OUTPUT_BUDGET) -> str:
@@ -312,38 +384,15 @@ def bounded_json(payload: dict[str, Any], budget: int = OUTPUT_BUDGET) -> str:
         rendered = json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
         if len(rendered.encode("utf-8")) <= budget:
             return rendered
-        item["truncated"] = True
-        if item.get("tags"):
-            item["tags"].pop()
-        elif item.get("project_summaries"):
-            item["project_summaries"].pop()
-        elif _prune_navigation_brief(item):
-            pass
-        elif len(item.get("navigation", [])) > 1:
-            item["navigation"].pop()
-            _recount_omitted(item)
-        elif len(str(item.get("query", ""))) > 24:
-            item["query"] = _safe_text(item["query"])[:24] + "…"
-        elif item.get("navigation"):
-            item["navigation"].pop()
-            _recount_omitted(item)
-        elif item.get("configured_projects"):
-            item["configured_projects"].pop()
-        elif len(str(item.get("diagnostic", ""))) > 160:
-            item["diagnostic"] = _safe_text(item["diagnostic"])[:160] + "…"
-        elif (
-            len(str(item.get("project", ""))) > 128
-            or len(str(item.get("scope", {}).get("project", ""))) > 128
-            or len(str((item.get("next_commands") or [""])[0])) > 256
-        ):
-            item["project"] = None
-            item.setdefault("scope", {})["project"] = None
-            item["scope"]["identity_truncated"] = True
-            item["next_commands"] = ["agent-memory brief"]
-        else:
-            # Required envelopes are comfortably smaller than 2 KiB after the
-            # optional fields above are gone.
-            raise ValueError("navigation JSON core exceeds output budget")
+        if not _prune_navigation_payload(item):
+            rendered = json.dumps(
+                _minimal_navigation_payload(item),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ) + "\n"
+            if len(rendered.encode("utf-8")) <= budget:
+                return rendered
+            raise ValueError("navigation JSON budget is too small for the required command")
 
 
 def _display(value: object, limit: int = 64) -> str:

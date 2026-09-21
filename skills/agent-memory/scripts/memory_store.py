@@ -182,6 +182,9 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         if current_list and stripped.startswith("-"):
             meta.setdefault(current_list, []).append(stripped[1:].strip().strip("\"'"))
             continue
+        if line[:1].isspace():
+            current_list = None
+            continue
         current_list = None
         if ":" not in line:
             continue
