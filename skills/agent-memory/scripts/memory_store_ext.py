@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 import memory_store as base
 from memory_config import MemoryError, MemoryRoot
+from memory_navigation import tier_sql_expression
 
 MEMORY_ID_RE = re.compile(r"^mem_[A-Za-z0-9_-]+$")
 LIFECYCLE_STATES = {"raw", "validated", "promoted", "superseded"}
@@ -132,9 +133,35 @@ def connect_db_readonly(path: Path) -> tuple[sqlite3.Connection, bool]:
 def _meta(path: Path):
     text = path.read_text(encoding="utf-8", errors="replace")
     m, body = base._parse_frontmatter(text)
+    nested_type = None
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        lines = text[4:end].splitlines() if end >= 0 else ()
+        for index, line in enumerate(lines):
+            key, _, value = line.partition(":")
+            if line[:1].isspace() or key.strip() != "metadata" or value.strip():
+                continue
+            children = []
+            for child in lines[index + 1 :]:
+                if child and not child[0].isspace():
+                    break
+                if child.strip():
+                    children.append(child)
+            if not children:
+                break
+            direct_indent = min(len(child) - len(child.lstrip()) for child in children)
+            for child in children:
+                indent = len(child) - len(child.lstrip())
+                if indent != direct_indent:
+                    continue
+                child_key, _, child_value = child.strip().partition(":")
+                if child_key == "type":
+                    nested_type = child_value.strip().strip("\"'") or None
+                    break
+            break
     return {
         "id": str(m.get("id") or "").strip() or None,
-        "type": str(m.get("type") or "").strip() or None,
+        "type": str(m.get("type") or nested_type or "").strip() or None,
         "status": str(m.get("status") or "").strip().lower() or None,
         "promoted_to": str(m.get("promoted_to") or "").strip() or None,
         "superseded_by": str(m.get("superseded_by") or "").strip() or None,
@@ -211,7 +238,32 @@ def search_documents(c, query, project=None, tags=(), limit=10, include_shared=T
     ]
 
 
-def list_documents(c, project=None, tags=(), limit=100, include_shared=True):
+def list_documents(
+    c, project=None, tags=(), limit=100, include_shared=True, tier_filter=None
+):
+    if tier_filter is not None:
+        sql = (
+            "SELECT d.id,d.path,d.title,d.brief FROM documents d "
+            "LEFT JOIN memory_meta m ON m.document_id=d.id WHERE 1=1"
+        )
+        params = []
+        if project:
+            scopes = [project] + (["_shared"] if include_shared else [])
+            placeholders = ",".join("?" for _ in scopes)
+            sql += (
+                " AND EXISTS (SELECT 1 FROM document_scopes s "
+                f"WHERE s.document_id=d.id AND s.scope IN ({placeholders}))"
+            )
+            params.extend(scopes)
+        for tag in tags:
+            sql = base._append_tag_filter(sql, params, tag)
+        sql += f" AND {tier_sql_expression(c)}=?"
+        sql += " ORDER BY d.mtime_ns DESC,d.path LIMIT ?"
+        params.extend([tier_filter, limit])
+        return [
+            _enrich(c, base._doc_payload(c, row))
+            for row in c.execute(sql, params)
+        ]
     return [
         _enrich(c, x)
         for x in base.list_documents(c, project, tags, limit, include_shared)

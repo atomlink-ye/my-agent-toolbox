@@ -30,7 +30,7 @@ from memory_format import (
     table_dump,
     yaml_dump,
 )
-from memory_navigation import navigation_inventory
+from memory_navigation import navigation_inventory, tier_details
 from memory_lifecycle import update_lifecycle, update_tier
 from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 from memory_store_ext import (
@@ -353,6 +353,8 @@ def build_parser():
         q.add_argument("--project")
         q.add_argument("--path", type=Path)
         q.add_argument("--tag", action="append", default=[])
+        if n == "list":
+            q.add_argument("--tier", choices=("core", "archive"))
         q.add_argument("--limit", type=int, default=10 if n == "search" else 100)
         q.add_argument("--no-shared", action="store_true")
     q = sub("links", "show links/backlinks")
@@ -369,6 +371,7 @@ def build_parser():
     q.add_argument("--related", action="append", default=[])
     q.add_argument("--root")
     q.add_argument("--status", choices=sorted(LIFECYCLE_STATES), default="raw")
+    q.add_argument("--tier", choices=("core", "archive"))
     q.add_argument("--allow-duplicate", action="store_true")
     q = sub("lifecycle", "change lifecycle")
     q.add_argument("document")
@@ -393,6 +396,7 @@ def build_parser():
     target.add_argument("--path", type=Path)
     target.add_argument("--project")
     q.add_argument("--tag", action="append", default=[])
+    q.add_argument("--tier", choices=("core", "archive"))
     q.add_argument("--no-shared", action="store_true")
     q = sub("doctor", "health diagnostics")
     q.add_argument("--path", type=Path)
@@ -486,6 +490,8 @@ def _navigation_payload(
     query=None,
     context_terms=(),
     core_only=False,
+    tier_filter=None,
+    filter_inventory=False,
 ):
     registered = context["status"] == "resolved"
     inventory = navigation_inventory(
@@ -497,7 +503,8 @@ def _navigation_payload(
         project_limit=project_limit,
         tag_limit=tag_limit,
         context_terms=context_terms,
-        tier_filter="core" if core_only else None,
+        tier_filter="core" if core_only else tier_filter,
+        filter_inventory=filter_inventory,
     )
     state = status_name
     if not registered and status_name != "no_match":
@@ -600,6 +607,45 @@ def _navigation_payload(
         "next_commands": next_commands,
         "truncated": False,
     }
+
+
+def _apply_tier_output(value, verbose=False, conn=None):
+    """Expose resolved tier audit details only in verbose CLI output."""
+    rows = value if isinstance(value, list) else (
+        [row for key in ("navigation", "results") for row in value.get(key, [])]
+        if isinstance(value, dict)
+        else []
+    )
+    meta_columns = (
+        {row[1] for row in conn.execute("PRAGMA table_info(memory_meta)")}
+        if conn is not None
+        else set()
+    )
+    tier_column = "tier" if "tier" in meta_columns else "NULL AS tier"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if verbose and conn is not None and row.get("id") is not None and not {
+            "type", "status", "tier"
+        }.issubset(row):
+            metadata = conn.execute(
+                "SELECT doc_type,lifecycle_status," + tier_column
+                + " FROM memory_meta WHERE document_id=?",
+                (row["id"],),
+            ).fetchone()
+            if metadata is not None:
+                row.setdefault("type", metadata[0])
+                row.setdefault("status", metadata[1])
+                row.setdefault("tier", metadata[2])
+        if verbose:
+            tier, source = tier_details(
+                row.get("tier"), row.get("type"), row.get("status")
+            )
+            row["tier"] = tier
+            row["tier_source"] = source
+        else:
+            row.pop("tier", None)
+            row.pop("tier_source", None)
 
 
 def _emit_bounded_payload(payload, fmt, budget=OUTPUT_BUDGET):
@@ -766,7 +812,9 @@ def main(argv=None):
             r = (
                 search_documents(c, a.query, project, a.tag, a.limit, not a.no_shared)
                 if a.command == "search"
-                else list_documents(c, project, a.tag, a.limit, not a.no_shared)
+                else list_documents(
+                    c, project, a.tag, a.limit, not a.no_shared, tier_filter=a.tier
+                )
             )
         elif a.command == "links":
             r = link_graph(c, a.document)
@@ -787,6 +835,7 @@ def main(argv=None):
                 related=a.related,
                 root=a.root or (str(pref) if pref else None),
                 status=a.status,
+                tier=a.tier,
                 allow_duplicate=a.allow_duplicate,
             )
             r.update(
@@ -826,7 +875,10 @@ def main(argv=None):
                 tag_limit=5 if a.command == "brief" else 10,
                 context_terms=(current_context_terms(a.path) if a.command == "brief" else ()),
                 core_only=a.command == "brief",
+                tier_filter=(a.tier if a.command == "context" else None),
+                filter_inventory=(a.command == "context" and a.tier is not None),
             )
+            _apply_tier_output(r, a.verbose, c)
             _emit_bounded_payload(
                 r,
                 a.output_format,
@@ -839,6 +891,8 @@ def main(argv=None):
             if a.command in {"search", "list"}
             else ()
         )
+        if a.command in {"search", "list"}:
+            _apply_tier_output(r, a.verbose, c)
         if a.command == "search" and a.output_format == "envelope":
             context = (
                 resolve_context(settings, path=a.path, project=a.project)

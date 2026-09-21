@@ -39,13 +39,22 @@ def _scope_clause(project: str | None, include_shared: bool) -> tuple[str, list[
     )
 
 
-def _count(conn: sqlite3.Connection, scope: str, tags: tuple[str, ...]) -> int:
+def _count(
+    conn: sqlite3.Connection,
+    scope: str,
+    tags: tuple[str, ...],
+    tier_filter: str | None = None,
+) -> int:
     tag_sql, tag_params = _tag_predicates(tags)
+    tier_sql = (
+        f" AND {tier_sql_expression(conn)}=?" if tier_filter is not None else ""
+    )
     row = conn.execute(
         "SELECT count(DISTINCT d.id) FROM documents d "
+        "LEFT JOIN memory_meta m ON m.document_id=d.id "
         "WHERE EXISTS (SELECT 1 FROM document_scopes s "
-        "WHERE s.document_id=d.id AND s.scope=?)" + tag_sql,
-        [scope, *tag_params],
+        "WHERE s.document_id=d.id AND s.scope=?)" + tag_sql + tier_sql,
+        [scope, *tag_params, *([tier_filter] if tier_filter is not None else [])],
     ).fetchone()
     return int(row[0])
 
@@ -55,22 +64,47 @@ def _tier_column(conn: sqlite3.Connection) -> str:
     return "m.tier AS tier" if "tier" in columns else "NULL AS tier"
 
 
-def _tier(
+def tier_details(
     explicit_tier: Any, doc_type: Any, lifecycle_status: Any
-) -> tuple[str, bool]:
-    """Classify from lifecycle/type metadata; unknown combinations default to archive."""
+) -> tuple[str, str]:
+    """Return the inferred tier and the first metadata rule that selected it."""
     tier = str(explicit_tier or "").strip().casefold()
     status = str(lifecycle_status or "").strip().casefold()
     kind = str(doc_type or "").strip().casefold()
     if tier in {"core", "archive"}:
-        return tier, False
+        return tier, "explicit"
     if status in {"validated", "promoted"}:
-        return "core", False
+        return "core", "status"
     if status in {"raw", "superseded"}:
-        return "archive", False
+        return "archive", "status"
     if kind in {"user", "feedback"}:
-        return "core", False
-    return "archive", True
+        return "core", "type"
+    return "archive", "default"
+
+
+def tier_sql_expression(conn: sqlite3.Connection, alias: str = "m") -> str:
+    """Build the same tier precedence as :func:`tier_details` for SQL filtering."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_meta)")}
+    tier = f"{alias}.tier" if "tier" in columns else "NULL"
+    status = f"lower(trim(COALESCE({alias}.lifecycle_status,'')))"
+    kind = f"lower(trim(COALESCE({alias}.doc_type,'')))"
+    return (
+        "CASE "
+        f"WHEN lower(trim(COALESCE({tier},''))) IN ('core','archive') "
+        f"THEN lower(trim({tier})) "
+        f"WHEN {status} IN ('validated','promoted') THEN 'core' "
+        f"WHEN {status} IN ('raw','superseded') THEN 'archive' "
+        f"WHEN {kind} IN ('user','feedback') THEN 'core' "
+        "ELSE 'archive' END"
+    )
+
+
+def _tier(
+    explicit_tier: Any, doc_type: Any, lifecycle_status: Any
+) -> tuple[str, bool]:
+    """Classify from lifecycle/type metadata; unknown combinations default to archive."""
+    tier, source = tier_details(explicit_tier, doc_type, lifecycle_status)
+    return tier, source == "default"
 
 
 def _visible_tier_counts(
@@ -78,16 +112,19 @@ def _visible_tier_counts(
     project: str | None,
     tags: tuple[str, ...],
     include_shared: bool,
+    tier_filter: str | None = None,
 ) -> dict[str, int]:
     visible_sql, visible_params = _scope_clause(project, include_shared)
     tag_sql, tag_params = _tag_predicates(tags)
     tier_column = _tier_column(conn)
+    tier_sql = (
+        f" AND {tier_sql_expression(conn)}=?" if tier_filter is not None else ""
+    )
     rows = conn.execute(
         "SELECT DISTINCT d.id,m.doc_type,m.lifecycle_status," + tier_column + " FROM documents d "
         "LEFT JOIN memory_meta m ON m.document_id=d.id WHERE 1=1"
-        + visible_sql
-        + tag_sql,
-        [*visible_params, *tag_params],
+        + visible_sql + tag_sql + tier_sql,
+        [*visible_params, *tag_params, *([tier_filter] if tier_filter is not None else [])],
     ).fetchall()
     counts = {"core": 0, "archive": 0, "defaulted": 0}
     for row in rows:
@@ -174,30 +211,44 @@ def navigation_inventory(
     tag_limit: int = 5,
     context_terms: Iterable[str] = (),
     tier_filter: str | None = None,
+    filter_inventory: bool = False,
 ) -> dict[str, Any]:
     """Return independently counted scope components plus a bounded index."""
     tags = tuple(tags)
     visible_sql, visible_params = _scope_clause(project, include_shared)
     tag_sql, tag_params = _tag_predicates(tags)
+    inventory_tier = tier_filter if filter_inventory else None
+    inventory_tier_sql = (
+        f" AND {tier_sql_expression(conn)}=?" if inventory_tier is not None else ""
+    )
     visible = int(
         conn.execute(
-            "SELECT count(DISTINCT d.id) FROM documents d WHERE 1=1"
-            + visible_sql
-            + tag_sql,
-            [*visible_params, *tag_params],
+            "SELECT count(DISTINCT d.id) FROM documents d "
+            "LEFT JOIN memory_meta m ON m.document_id=d.id WHERE 1=1"
+            + visible_sql + tag_sql + inventory_tier_sql,
+            [*visible_params, *tag_params,
+             *([inventory_tier] if inventory_tier is not None else [])],
         ).fetchone()[0]
     )
-    global_count = _count(conn, SHARED_SCOPE, tags) if include_shared else 0
-    project_count = _count(conn, project, tags) if project is not None else None
-    tier_counts = _visible_tier_counts(conn, project, tags, include_shared)
+    global_count = (
+        _count(conn, SHARED_SCOPE, tags, inventory_tier) if include_shared else 0
+    )
+    project_count = (
+        _count(conn, project, tags, inventory_tier) if project is not None else None
+    )
+    tier_counts = _visible_tier_counts(
+        conn, project, tags, include_shared, inventory_tier
+    )
 
     tag_rows = conn.execute(
         "SELECT t.tag,count(DISTINCT t.document_id) AS count "
-        "FROM document_tags t JOIN documents d ON d.id=t.document_id WHERE 1=1"
-        + visible_sql
-        + tag_sql
+        "FROM document_tags t JOIN documents d ON d.id=t.document_id "
+        "LEFT JOIN memory_meta m ON m.document_id=d.id WHERE 1=1"
+        + visible_sql + tag_sql + inventory_tier_sql
         + " GROUP BY t.tag ORDER BY count DESC,lower(t.tag),t.tag LIMIT ?",
-        [*visible_params, *tag_params, max(0, tag_limit)],
+        [*visible_params, *tag_params,
+         *([inventory_tier] if inventory_tier is not None else []),
+         max(0, tag_limit)],
     )
     top_tags = [{"tag": row["tag"], "count": int(row["count"])} for row in tag_rows]
     context_terms = tuple(context_terms)
@@ -225,9 +276,11 @@ def navigation_inventory(
         for row in conn.execute(
             "SELECT s.scope,count(DISTINCT d.id) AS count "
             "FROM document_scopes s JOIN documents d ON d.id=s.document_id "
-            "WHERE s.scope<>?" + tag_sql
+            "LEFT JOIN memory_meta m ON m.document_id=d.id "
+            "WHERE s.scope<>?" + tag_sql + inventory_tier_sql
             + " GROUP BY s.scope ORDER BY lower(s.scope),s.scope",
-            [SHARED_SCOPE, *tag_params],
+            [SHARED_SCOPE, *tag_params,
+             *([inventory_tier] if inventory_tier is not None else [])],
         )
     ]
     shown = {row["id"] for row in [*global_rows, *project_rows]}
