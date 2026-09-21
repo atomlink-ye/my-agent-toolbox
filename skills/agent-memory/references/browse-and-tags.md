@@ -38,6 +38,10 @@ recalled with either `search "agent server learnings"` or `search "learnings age
 Hyphenated tag segments also contribute word aliases (`agent-server` -> `agent`, `server`).
 Results still show only the full canonical tag.
 
+Default `search` and `list` output is a compact routing list: use its printed base plus
+relative path to read the authoritative Markdown. Add `--json` for minified structured
+rows or `--json --verbose` for complete search diagnostics.
+
 Multiple explicit `--tag` filters are ANDed. Tags classify knowledge; project visibility
 still comes only from settings scopes.
 

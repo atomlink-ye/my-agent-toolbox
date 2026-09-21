@@ -58,7 +58,7 @@ fresh bootstrap:
 "${AM[@]}" --json init
 "${AM[@]}" --json sync
 "${AM[@]}" --json status
-"${AM[@]}" --json search "learnings agent server" --path /abs/path/to/project
+"${AM[@]}" search "learnings agent server" --path /abs/path/to/project
 ```
 
 Requirements: Python 3.10+, standard-library SQLite with FTS5, and the complete skill

@@ -392,15 +392,20 @@ file.
 
 The implementation is standard-library-only Python 3.10+ plus SQLite/FTS5.
 
-Every subcommand except `browse` emits deterministic YAML by default, including `init` and
-`doctor`. `browse` defaults to human-readable grouped text.
-Choose one mutually exclusive global flag when needed: `--json` keeps the previous
-machine-readable JSON contract, `--table` renders compact tables for humans, and
-`--text` selects the legacy human-readable output; `--yaml` explicitly selects YAML. For example:
+`search` and `list` emit compact routing hints by default; each relative result path is
+resolved against the absolute base printed above it. `browse` defaults to grouped text,
+and other subcommands default to deterministic YAML. Choose one mutually exclusive output
+flag when needed: `--compact` explicitly selects routing hints, `--json` emits minified
+machine-readable JSON with null/empty fields omitted, `--table` renders compact tables,
+`--text` selects the legacy human-readable output, and `--yaml` explicitly selects YAML.
+Add `--verbose` to `--json` (or use it alone) for complete pretty-printed diagnostics.
+For example:
 
 ```sh
 agent-memory status                 # YAML (default)
 agent-memory --json status          # JSON for scripts
+agent-memory search "sandbox filesystem" --path ~/workspace/agent-server # compact route; then read the path
+agent-memory --json --verbose search "sandbox filesystem" # full search diagnostics
 agent-memory --table projects       # compact table
 agent-memory --text doctor          # legacy human-readable view
 agent-memory --yaml browse          # explicit YAML instead of browse's text default
@@ -421,13 +426,13 @@ agent-memory --json resolve --path ~/workspace/agent-server
 agent-memory --json sync
 
 # project-safe recall; shared memory is included
-agent-memory --json search "sandbox filesystem" --path ~/workspace/agent-server
-agent-memory --json search "deployment" --project agent-server --tag operations
-agent-memory --json search "deployment" --project agent-server --tag agent-server:operations
-agent-memory --json list --path ~/workspace/agent-server --tag architecture
+agent-memory search "sandbox filesystem" --path ~/workspace/agent-server
+agent-memory search "deployment" --project agent-server --tag operations
+agent-memory search "deployment" --project agent-server --tag agent-server:operations
+agent-memory list --path ~/workspace/agent-server --tag architecture
 
 # deliberately global/cross-project recall
-agent-memory --json search "review workflow"
+agent-memory search "review workflow"
 agent-memory browse --path ~/workspace/agent-server --tag operations
 
 # graph inspection

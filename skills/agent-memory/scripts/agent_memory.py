@@ -19,7 +19,7 @@ from memory_config import (
     resolve_project_binding,
     shared_roots,
 )
-from memory_format import table_dump, yaml_dump
+from memory_format import compact_dump, table_dump, yaml_dump
 from memory_lifecycle import update_lifecycle
 from memory_snapshot import inspect_snapshot, search_snapshot, snapshot_registry
 from memory_store_ext import (
@@ -102,9 +102,34 @@ def _human_links(result):
                 print(f"  - {link['title']} <- {link['path']}")
 
 
-def _emit(r, cmd, fmt):
+def _slim_json(value, key=None):
+    """Drop empty JSON fields and bound diagnostic score precision."""
+    if isinstance(value, dict):
+        return {
+            child_key: _slim_json(child, child_key)
+            for child_key, child in value.items()
+            if child is not None and child != "" and child != []
+        }
+    if isinstance(value, list):
+        return [_slim_json(child) for child in value]
+    if key == "score" and isinstance(value, float):
+        return round(value, 6)
+    return value
+
+
+def _emit(r, cmd, fmt, verbose=False, memory_roots=()):
     if fmt == "json":
-        print(json.dumps(r, indent=2, ensure_ascii=False))
+        print(
+            json.dumps(
+                r if verbose else _slim_json(r),
+                indent=2 if verbose else None,
+                ensure_ascii=False,
+                separators=None if verbose else (",", ":"),
+            )
+        )
+        return
+    if fmt == "compact":
+        print(compact_dump(r, memory_roots))
         return
     if fmt == "table":
         print(table_dump(cmd, r))
@@ -152,6 +177,13 @@ def _emit(r, cmd, fmt):
 def _opts(p):
     g = p.add_mutually_exclusive_group()
     g.add_argument(
+        "--compact",
+        dest="output_format",
+        action="store_const",
+        const="compact",
+        default=argparse.SUPPRESS,
+    )
+    g.add_argument(
         "--json",
         dest="output_format",
         action="store_const",
@@ -164,6 +196,12 @@ def _opts(p):
         action="store_const",
         const="table",
         default=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="emit the complete pretty-printed JSON diagnostics",
     )
     g.add_argument(
         "--text",
@@ -185,7 +223,7 @@ def build_parser():
     p = argparse.ArgumentParser(prog="agent-memory")
     p.add_argument("--settings", type=Path, default=default_settings_path())
     _opts(p)
-    p.set_defaults(output_format=None)
+    p.set_defaults(output_format=None, verbose=False)
     s = p.add_subparsers(dest="command", required=True)
 
     def sub(n, h):
@@ -328,16 +366,28 @@ def _browse_documents(conn, project=None, tags=(), limit=100, include_shared=Tru
 def main(argv=None):
     p = build_parser()
     raw = sys.argv[1:] if argv is None else argv
-    if len({x for x in raw if x in {"--json", "--table", "--text", "--yaml"}}) > 1:
+    if len({x for x in raw if x in {"--compact", "--json", "--table", "--text", "--yaml"}}) > 1:
         p.error("output options are mutually exclusive")
     a = p.parse_args(raw)
-    a.output_format = a.output_format or ("text" if a.command == "browse" else "yaml")
+    if a.output_format == "compact" and a.command not in {"search", "list"}:
+        p.error("--compact is only available for search and list")
+    if a.verbose and a.output_format not in {None, "json"}:
+        p.error("--verbose may only be used with --json")
+    a.output_format = a.output_format or (
+        "json"
+        if a.verbose
+        else "compact"
+        if a.command in {"search", "list"}
+        else "text"
+        if a.command == "browse"
+        else "yaml"
+    )
     sp = a.settings.expanduser().resolve(strict=False)
     if a.command == "init":
         try:
             init_settings(sp, a.force)
             r = {"settings": str(sp)}
-            _emit(r, "init", a.output_format)
+            _emit(r, "init", a.output_format, a.verbose)
             return 0
         except (MemoryError, OSError) as e:
             print(f"agent-memory: {e}", file=sys.stderr)
@@ -348,7 +398,7 @@ def main(argv=None):
             db = database_path(settings, sp)
         except (MemoryError, OSError) as e:
             r = _fail("settings_invalid", str(e), sp)
-            _emit(r, "doctor", a.output_format)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2
         if not db.exists():
             r = _fail(
@@ -356,17 +406,17 @@ def main(argv=None):
                 "SQLite index does not exist; run agent-memory sync first",
                 db,
             )
-            _emit(r, "doctor", a.output_format)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2
         try:
             c = _readonly_connection(db)
             r = doctor(c, settings, sp, db, a.path)
             c.close()
-            _emit(r, "doctor", a.output_format)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2 if r["status"] == "error" else 1 if r["status"] == "warn" else 0
         except Exception as e:
             r = _fail("doctor_failed", _database_error_message(e, db), db)
-            _emit(r, "doctor", a.output_format)
+            _emit(r, "doctor", a.output_format, a.verbose)
             return 2
     if a.command == "snapshot":
         try:
@@ -391,7 +441,7 @@ def main(argv=None):
                     collect_memory_roots(settings, sp),
                     a.output,
                 )
-            _emit(r, "snapshot", a.output_format)
+            _emit(r, "snapshot", a.output_format, a.verbose)
             return 0
         except (MemoryError, OSError, sqlite3.Error) as e:
             print(f"agent-memory: {e}", file=sys.stderr)
@@ -427,7 +477,7 @@ def main(argv=None):
                 "shared": [str(x.path) for x in shared_roots(settings, sp)],
                 "tags": list(b.tags),
             }
-            _emit(r, a.command, a.output_format)
+            _emit(r, a.command, a.output_format, a.verbose)
             return 0
         c = (
             _readonly_connection(db)
@@ -482,7 +532,12 @@ def main(argv=None):
         elif a.command == "browse":
             project = _query_project(settings, a.project, a.path)
             r = _browse_documents(c, project, a.tag, a.limit, not a.no_shared)
-        _emit(r, a.command, a.output_format)
+        roots = (
+            [root.path for root in collect_memory_roots(settings, sp)]
+            if a.command in {"search", "list"}
+            else ()
+        )
+        _emit(r, a.command, a.output_format, a.verbose, roots)
         c.close()
         return 0
     except (MemoryError, OSError, sqlite3.Error) as e:

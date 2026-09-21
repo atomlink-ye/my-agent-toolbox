@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+from pathlib import Path
 from typing import Any, Iterable
 
 _PLAIN_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
@@ -110,6 +112,59 @@ def yaml_dump(value: object, indent: int = 0) -> str:
                 raise TypeError(f"unsupported YAML value: {type(item).__name__}")
         return "\n".join(lines)
     raise TypeError(f"unsupported YAML value: {type(value).__name__}")
+
+
+def _compact_path_base(result: list[object], memory_roots: Iterable[Path]) -> Path | None:
+    """Return one base that makes every displayed document path directly resolvable."""
+    paths = [
+        Path(item["path"]).expanduser().resolve(strict=False)
+        for item in result
+        if isinstance(item, dict) and item.get("path")
+    ]
+    roots = [Path(root).expanduser().resolve(strict=False) for root in memory_roots]
+    used_roots = [
+        root
+        for root in roots
+        if any(path == root or root in path.parents for path in paths)
+    ]
+    if not paths or not used_roots:
+        return None
+    try:
+        return Path(os.path.commonpath([str(root) for root in used_roots]))
+    except ValueError:
+        return None
+
+
+def compact_dump(result: object, memory_roots: Iterable[Path] = ()) -> str:
+    """Render search/list rows as routing hints instead of diagnostic records."""
+    if not isinstance(result, list):
+        raise TypeError("compact output requires a list result")
+    if not result:
+        return "(no results)"
+
+    base = _compact_path_base(result, memory_roots)
+    lines = [f"Read paths relative to {base}:"] if base is not None else []
+    for index, item in enumerate(result, 1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "(untitled)").strip()
+        match_mode = str(item.get("match_mode") or "strict").strip()
+        suffix = "" if match_mode == "strict" else f" ~{match_mode}"
+        lines.append(f"{index}. {title}{suffix}")
+
+        brief = str(item.get("brief") or "").strip()
+        if brief and brief != title:
+            lines.append(f"   {brief}")
+
+        raw_path = Path(str(item.get("path") or "")).expanduser()
+        display_path = raw_path
+        if base is not None:
+            try:
+                display_path = raw_path.resolve(strict=False).relative_to(base)
+            except ValueError:
+                pass
+        lines.append(f"   {display_path}")
+    return "\n".join(lines)
 
 
 def _display(value: object, limit: int = 64) -> str:

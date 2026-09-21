@@ -38,7 +38,7 @@ case "$doctor_rc" in
   2) printf '%s\n' 'agent-memory doctor reported errors; stop writes and diagnose' >&2; exit 2 ;;
   *) printf '%s\n' "unexpected doctor exit: $doctor_rc" >&2; exit "$doctor_rc" ;;
 esac
-"${AM[@]}" --json search "<query>" --path /abs/path/to/project
+"${AM[@]}" search "<query>" --path /abs/path/to/project
 ```
 
 ## Sync

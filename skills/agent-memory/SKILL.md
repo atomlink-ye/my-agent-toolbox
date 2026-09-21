@@ -71,18 +71,20 @@ skill copy, or a bare terminal.
 ## Recall before starting non-trivial work
 
 ```bash
-"${AM[@]}" --json search "<query>" --path /abs/path/to/project
+"${AM[@]}" search "<query>" --path /abs/path/to/project
 ```
 
 - Run this before non-trivial work, or whenever asking "have we seen this before?"
-- Prefer the returned `brief` to judge relevance, then read the returned `path` — the
-  Markdown file, not the JSON row, is the source of truth.
-- **Current Chinese-search limitation**: the current `unicode61` index can store a whole
-  contiguous Han run as one opaque token. Adding spaces to the query does not split the
-  already-indexed text, so it is not a general workaround. Until the auxiliary Han index
-  is present and an explicit `sync` has populated it, use a known ASCII anchor when one
-  exists and treat zero results as inconclusive. The planned Han route is substring
-  retrieval, not general Chinese word segmentation or semantic search.
+- `search` and `list` default to the compact routing format. Each result contains a title,
+  an optional non-duplicate brief, and a path relative to the printed memory-root base.
+  Join the base and relative path, then **read that Markdown file**. Search output is a
+  route to the source of truth, not the source content itself.
+- A suffix such as `~relaxed`, `~cjk`, or `~hybrid` identifies a non-strict retrieval
+  route. Strict matches have no suffix. Use `--compact` to request this format explicitly.
+- Use `--json` only for scripts that need structured rows. It emits whitespace-minified
+  JSON, omits null/empty fields, and preserves existing non-empty field names. For search
+  diagnostics, use `--json --verbose` (or bare `--verbose`) to get the complete,
+  pretty-printed record including match mode, scores, and matched/missing terms.
 - `--path` is worth passing but not worth over-engineering here: an unbound or wrong
   path silently falls back to a global search rather than failing. If a query genuinely
   returns nothing, retry with fewer/looser terms before concluding it doesn't exist.
