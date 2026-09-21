@@ -1,4 +1,5 @@
-import importlib.util,json,sys,tempfile,unittest
+import importlib.util,json,sys,tempfile,unittest,io
+from contextlib import redirect_stderr,redirect_stdout
 from pathlib import Path
 MODULE=Path(__file__).parents[3]/"skills"/"agent-memory"/"scripts"/"agent_memory.py";sys.path.insert(0,str(MODULE.parent));spec=importlib.util.spec_from_file_location("agent_memory_roadmap",MODULE);am=importlib.util.module_from_spec(spec);sys.modules[spec.name]=am;spec.loader.exec_module(am)
 from memory_doctor_ext import doctor
@@ -15,6 +16,21 @@ class RoadmapTests(unittest.TestCase):
  def test_lifecycle_promote_and_stable_link(self):
   a=am.capture_memory(self.binding,"learning","Evidence");b=am.capture_memory(self.binding,"learning","Canonical rule");self.sync();update_lifecycle(self.conn,a["memory_id"],"promoted",target=b["memory_id"]);self.sync();row=[x for x in am.list_documents(self.conn,project="demo") if x["memory_id"]==a["memory_id"]][0];self.assertEqual(row["status"],"promoted");self.assertEqual(row["promoted_to"],f"memory://{b['memory_id']}")
   p=Path(a["path"]);p.write_text(p.read_text()+f"\n[canonical](memory://{b['memory_id']})\n");self.sync();graph=am.link_graph(self.conn,a["memory_id"]);self.assertTrue(any(x.get("memory_id")==b["memory_id"] and x["resolved"] for x in graph["outbound"]))
+ def test_cli_tier_override_preserves_lifecycle_and_all_other_frontmatter_bytes(self):
+  note=self.memory/"explicit-tier.md";original='---\nid: mem_explicit_tier\ntitle: "Tier note"\nstatus: raw\npromoted_to: memory://mem_target\ntier: "archive"\ncustom: "quoted: value"\nunknown_block:\n  status: nested status\n  tier: nested tier\n# status: comment\n# tier: comment\n---\n\nBody remains unchanged.\n';note.write_text(original,encoding="utf-8");other=self.memory/"untouched.md";other_original="---\ntitle: Untouched\nstatus: validated\ncustom: keep\n---\n\nNo changes here.\n";other.write_text(other_original,encoding="utf-8");self.sync()
+  self.assertEqual(am.LIFECYCLE_STATES,{"raw","validated","promoted","superseded"})
+  for tier in ("core","archive"):
+   out,err=io.StringIO(),io.StringIO()
+   with redirect_stdout(out),redirect_stderr(err):code=am.main(["--settings",str(self.settings_path),"--json","lifecycle","mem_explicit_tier","--tier",tier])
+   self.assertEqual(code,0,err.getvalue())
+   expected=original.replace('tier: "archive"',f"tier: {tier}",1)
+   self.assertEqual(note.read_text(encoding="utf-8"),expected)
+   self.assertEqual(other.read_text(encoding="utf-8"),other_original)
+   self.assertIn('"tier":"'+tier+'"',out.getvalue())
+  for args in (("lifecycle","mem_explicit_tier"),("lifecycle","mem_explicit_tier","validated","--tier","core")):
+   out,err=io.StringIO(),io.StringIO()
+   with redirect_stdout(out),redirect_stderr(err),self.assertRaises(SystemExit) as raised:am.main(["--settings",str(self.settings_path),*args])
+   self.assertEqual(raised.exception.code,2)
  def test_doctor_detects_duplicate_ids(self):
   a=am.capture_memory(self.binding,"learning","First",memory_id="mem_same");am.capture_memory(self.binding,"learning","Second",memory_id="mem_same");self.sync();r=doctor(self.conn,self.settings,self.settings_path,self.db);self.assertEqual(r["status"],"error");self.assertIn("memory_id_duplicate",[x["code"] for x in r["checks"]])
 if __name__=="__main__":unittest.main()

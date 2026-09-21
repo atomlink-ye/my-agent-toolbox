@@ -77,17 +77,28 @@ query such as `conventions`, `setup`, or `best practices`:
 "${AM[@]}" --json brief
 ```
 
-The brief is the map of the current visible scope. Check its resolved scope, document
-count, index state, tags, topic hooks, and navigation. For each hook that is relevant to
-the task, use the agent's ordinary file-reading tool to read the routed Markdown topic.
-The CLI output is routing metadata, not the memory content and not a substitute for
-reading the source file.
+The brief selects core-tier candidates while its counts report all visible notes, split
+between core and archive. Check its resolved scope, counts, tags, topic hooks, and routes,
+then read relevant Markdown topics with the ordinary file-reading tool. The CLI output is
+routing metadata, not memory content.
 
-If the brief does not expose enough routes, expand the same visible scope:
+Tier is independent of lifecycle status. An explicit top-level `tier: core` or
+`tier: archive` wins; otherwise `raw`/`superseded` infer archive, `validated`/`promoted`
+infer core, and `type: user`/`type: feedback` infer core. Other metadata defaults to
+archive and is reported in the `tier_default_archive` diagnostic and `defaulted` count.
+If `core=0`, follow the brief's `next_commands` for this same scope.
+
+If the brief does not expose enough routes, expand the same visible scope with the
+all-tier context inventory (8192-byte output budget; brief is limited to 2048 bytes):
 
 ```bash
 "${AM[@]}" --json context
 ```
+
+When context shows an archive note that should appear in future briefs, use its document
+ID or stable memory ID: `agent-memory lifecycle <id> --tier core`. This writes only the
+top-level tier field and leaves lifecycle status unchanged. Use `--tier archive` to
+explicitly keep a note out of brief.
 
 Use a targeted search only when the task supplies a concrete term, identifier, error, or
 other evidence worth locating:

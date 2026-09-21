@@ -114,6 +114,36 @@ class AgentMemoryOutputTests(unittest.TestCase):
         self.assertIn("Shared route", text_output)
         self.assertIn("omitted: 0", text_output)
 
+    def test_pathological_navigation_commands_and_guidance_stay_bounded(self):
+        oversized = "/workspace/" + ("long-component/" * 900) + "note.md"
+        payload = {
+            "status": "unregistered",
+            "project": oversized,
+            "source": "path",
+            "scope": {"project": oversized, "source": "path", "include_global": True, "tags": []},
+            "counts": {"distinct": 1, "global": 1, "project": None, "core": 0, "archive": 1, "defaulted": 0},
+            "tags": [],
+            "navigation": [{"id": 4, "scope": "_shared", "title": "Archive", "brief": "x" * 5000, "path": oversized}],
+            "project_summaries": [],
+            "configured_projects": [],
+            "omitted": 0,
+            "diagnostics": [],
+            "diagnostic": "x" * 5000,
+            "tier_guidance": "x" * 5000,
+            "next_commands": [f"agent-memory context --path {oversized}", f"agent-memory lifecycle {oversized} --tier core"],
+            "truncated": False,
+        }
+
+        json_output = bounded_json(payload, budget=2048)
+        text_output = bounded_navigation_text(payload, budget=2048)
+        structured = json.loads(json_output)
+
+        self.assertLessEqual(len(json_output.encode("utf-8")), 2048)
+        self.assertLessEqual(len(text_output.encode("utf-8")), 2048)
+        self.assertTrue(structured["next_commands"])
+        self.assertTrue(structured["next_commands"][0].startswith("agent-memory "))
+        self.assertIn("next: agent-memory context", text_output)
+
     def test_init_and_doctor_use_the_shared_formatter(self):
         fresh = self.root / "fresh-settings.json"
         output = io.StringIO()

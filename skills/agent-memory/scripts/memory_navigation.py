@@ -50,25 +50,85 @@ def _count(conn: sqlite3.Connection, scope: str, tags: tuple[str, ...]) -> int:
     return int(row[0])
 
 
+def _tier_column(conn: sqlite3.Connection) -> str:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_meta)")}
+    return "m.tier AS tier" if "tier" in columns else "NULL AS tier"
+
+
+def _tier(
+    explicit_tier: Any, doc_type: Any, lifecycle_status: Any
+) -> tuple[str, bool]:
+    """Classify from lifecycle/type metadata; unknown combinations default to archive."""
+    tier = str(explicit_tier or "").strip().casefold()
+    status = str(lifecycle_status or "").strip().casefold()
+    kind = str(doc_type or "").strip().casefold()
+    if tier in {"core", "archive"}:
+        return tier, False
+    if status in {"validated", "promoted"}:
+        return "core", False
+    if status in {"raw", "superseded"}:
+        return "archive", False
+    if kind in {"user", "feedback"}:
+        return "core", False
+    return "archive", True
+
+
+def _visible_tier_counts(
+    conn: sqlite3.Connection,
+    project: str | None,
+    tags: tuple[str, ...],
+    include_shared: bool,
+) -> dict[str, int]:
+    visible_sql, visible_params = _scope_clause(project, include_shared)
+    tag_sql, tag_params = _tag_predicates(tags)
+    tier_column = _tier_column(conn)
+    rows = conn.execute(
+        "SELECT DISTINCT d.id,m.doc_type,m.lifecycle_status," + tier_column + " FROM documents d "
+        "LEFT JOIN memory_meta m ON m.document_id=d.id WHERE 1=1"
+        + visible_sql
+        + tag_sql,
+        [*visible_params, *tag_params],
+    ).fetchall()
+    counts = {"core": 0, "archive": 0, "defaulted": 0}
+    for row in rows:
+        tier, defaulted = _tier(row["tier"], row["doc_type"], row["lifecycle_status"])
+        counts[tier] += 1
+        counts["defaulted"] += int(defaulted)
+    return counts
+
+
 def _sample(
     conn: sqlite3.Connection,
     scope: str,
     tags: tuple[str, ...],
     limit: int,
     context_terms: tuple[str, ...] = (),
+    tier_filter: str | None = None,
+    exclude_ids: Iterable[int] = (),
 ) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
     tag_sql, tag_params = _tag_predicates(tags)
+    tier_column = _tier_column(conn)
     rows = conn.execute(
-        "SELECT d.id,d.title,d.brief,d.path,d.mtime_ns,"
+        "SELECT d.id,d.title,d.brief,d.path,d.mtime_ns,m.doc_type,m.lifecycle_status,"
+        + tier_column + ","
         "(SELECT group_concat(t.tag,' ') FROM document_tags t WHERE t.document_id=d.id) AS tags "
-        "FROM documents d "
+        "FROM documents d LEFT JOIN memory_meta m ON m.document_id=d.id "
         "WHERE EXISTS (SELECT 1 FROM document_scopes s "
         "WHERE s.document_id=d.id AND s.scope=?)" + tag_sql
         + " ORDER BY d.mtime_ns DESC,d.path",
         [scope, *tag_params],
     ).fetchall()
+    excluded = set(exclude_ids)
+    if excluded:
+        rows = [row for row in rows if int(row["id"]) not in excluded]
+    if tier_filter is not None:
+        rows = [
+            row
+            for row in rows
+            if _tier(row["tier"], row["doc_type"], row["lifecycle_status"])[0] == tier_filter
+        ]
     terms = {
         token
         for term in context_terms
@@ -113,6 +173,7 @@ def navigation_inventory(
     project_limit: int = 4,
     tag_limit: int = 5,
     context_terms: Iterable[str] = (),
+    tier_filter: str | None = None,
 ) -> dict[str, Any]:
     """Return independently counted scope components plus a bounded index."""
     tags = tuple(tags)
@@ -128,6 +189,7 @@ def navigation_inventory(
     )
     global_count = _count(conn, SHARED_SCOPE, tags) if include_shared else 0
     project_count = _count(conn, project, tags) if project is not None else None
+    tier_counts = _visible_tier_counts(conn, project, tags, include_shared)
 
     tag_rows = conn.execute(
         "SELECT t.tag,count(DISTINCT t.document_id) AS count "
@@ -139,12 +201,25 @@ def navigation_inventory(
     )
     top_tags = [{"tag": row["tag"], "count": int(row["count"])} for row in tag_rows]
     context_terms = tuple(context_terms)
+    project_rows = (
+        _sample(conn, project, tags, project_limit, context_terms, tier_filter)
+        if project
+        else []
+    )
+    project_ids = {row["id"] for row in project_rows}
     global_rows = (
-        _sample(conn, SHARED_SCOPE, tags, global_limit, context_terms)
+        _sample(
+            conn,
+            SHARED_SCOPE,
+            tags,
+            global_limit,
+            context_terms,
+            tier_filter,
+            exclude_ids=project_ids,
+        )
         if include_shared
         else []
     )
-    project_rows = _sample(conn, project, tags, project_limit, context_terms) if project else []
     project_summaries = [
         {"project": str(row["scope"]), "count": int(row["count"])}
         for row in conn.execute(
@@ -162,10 +237,22 @@ def navigation_inventory(
             "global": global_count,
             "project": project_count,
             "components_overlap": True,
+            **tier_counts,
         },
         "tags": top_tags,
         "global": global_rows,
         "project": project_rows,
         "project_summaries": project_summaries,
         "omitted": max(0, visible - len(shown)),
+        "diagnostics": (
+            [
+                {
+                    "code": "tier_default_archive",
+                    "severity": "info",
+                    "count": tier_counts["defaulted"],
+                }
+            ]
+            if tier_counts["defaulted"]
+            else []
+        ),
     }

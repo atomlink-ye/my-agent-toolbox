@@ -22,16 +22,27 @@ The daily loop is **brief-first**. At task start, run one unparameterized comman
 "${AM[@]}" --json brief
 ```
 
-It reports the actual visible scope, document count, index state, tags, topic hooks, and
-navigation. Read any relevant topic path with the agent's normal file Read operation;
-routes and search rows are not the source content. Do not start by guessing broad terms
-such as `conventions`.
+It selects core-tier routes and reports honest visible totals, including core and archive
+counts. Read relevant topic paths with the agent's normal file Read operation; routes are
+not the source content. Do not start by guessing broad terms such as `conventions`.
 
-When the first map is too compact, expand it in the same scope:
+Tier is separate from lifecycle. An explicit top-level `tier: core|archive` wins; without
+one, `raw`/`superseded` infer archive, `validated`/`promoted` infer core, and `type: user`
+or `type: feedback` infer core. Other metadata defaults to archive and appears in the
+`defaulted` count and `tier_default_archive` diagnostic. When core is empty, follow the
+returned `next_commands` for registration, context, or capture guidance.
+
+When the first map is too compact, expand it in the same scope. Context includes both
+tiers and has an 8192-byte output budget; brief remains bounded to 2048 bytes:
 
 ```bash
 "${AM[@]}" --json context
 ```
+
+To change a note's tier after reviewing context, run
+`agent-memory lifecycle <id> --tier core` or `agent-memory lifecycle <id> --tier archive`,
+using its numeric document ID or stable memory ID. This changes only the tier field, not
+the lifecycle status.
 
 Reserve search for concrete evidence:
 
@@ -296,13 +307,15 @@ visibility, or the longest-prefix binding rules.
 ## Markdown memory format
 
 Any `.md` file under a configured memory root is indexed. Frontmatter is optional. The MVE
-supports `title`, `brief`, `type`, and `tags` in a deliberately small YAML-like subset:
+supports `title`, `brief`, `type`, `tags`, and the separate `tier` override in a deliberately
+small YAML-like subset:
 
 ```md
 ---
 title: Agent Team Operations
 brief: Durable operating knowledge for Agent Teams deployment and maintenance.
 type: reference
+tier: archive
 tags: [agent-server:operations, knowledge:runbook]
 ---
 
@@ -316,8 +329,14 @@ non-heading paragraph is used. Tags from settings and frontmatter are merged and
 canonical hierarchical form.
 
 `type` is an explicit source-level classification (for example `learning`, `error`,
-`feedback`, or `reference`). It remains deliberately separate from project scope and tags;
-the MVE preserves it in Markdown rather than adding another filter surface prematurely.
+`feedback`, or `reference`). It remains separate from project scope and tags.
+
+`tier` accepts `core` or `archive`. Brief includes only core candidates; context includes
+both tiers. Without an explicit `tier`, lifecycle `raw`/`superseded` infer archive and
+`validated`/`promoted` infer core, followed by `type: user`/`type: feedback` as core. Other
+metadata defaults to archive and contributes to `defaulted` plus the
+`tier_default_archive` diagnostic. Use `agent-memory lifecycle <id> --tier core|archive`
+to override the inferred tier without changing lifecycle status.
 
 Project scope is controlled by settings rather than file frontmatter. A note cannot place
 itself into another project's search scope by declaring a metadata field.
@@ -394,6 +413,14 @@ agent-memory lifecycle mem_old superseded --target memory://mem_canonical
 registry. Doctor checks ID validity/duplication, lifecycle values, and missing lifecycle or
 `memory://` targets.
 
+Tier is independent of lifecycle status. Set only the tier field with a numeric document ID
+or stable memory ID; this leaves `status`, `promoted_to`, and `superseded_by` unchanged:
+
+```sh
+agent-memory lifecycle mem_evidence --tier core
+agent-memory lifecycle mem_old --tier archive
+```
+
 ## SQLite model
 
 SQLite is rebuildable derived state:
@@ -416,6 +443,9 @@ links
   target_path
   target_document_id?   # null when dangling/not indexed
   href, label, anchor
+
+memory_meta
+  document_id, memory_id, doc_type, lifecycle_status, promoted_to, superseded_by, tier
 ```
 
 Subtag lookup does not need duplicate rows or a second alias table in the MVE. Filtering

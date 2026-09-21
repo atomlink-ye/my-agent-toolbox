@@ -44,6 +44,21 @@ malformed IDs, invalid lifecycle values, and unresolved lifecycle or `memory://`
 Legacy Markdown without an ID remains valid; Doctor reports it as migration information,
 not a reason to manufacture lifecycle transitions.
 
+Tier is separate from lifecycle. Brief shows core-tier notes; context includes both core
+and archive tiers. The index infers tier from explicit `tier: core|archive`, then lifecycle
+status (`raw`/`superseded` → archive; `validated`/`promoted` → core), then `type: user` or
+`type: feedback` → core. Other notes default to archive; brief/context report the default
+count and diagnostic. A top-level tier override wins over inference and does not change
+`status`, `promoted_to`, or `superseded_by`:
+
+```sh
+agent-memory lifecycle mem_evidence --tier core
+agent-memory lifecycle mem_old --tier archive
+```
+
+Use a numeric document ID or stable `mem_…` ID. Lifecycle still requires one of its four
+statuses, or the separate `--tier core|archive` option.
+
 ## Promote instead of duplicating
 
 A captured learning starts as evidence, not automatically as a global rule. When it is
