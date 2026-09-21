@@ -91,6 +91,14 @@ class NavigationContractTests(unittest.TestCase):
         self.assertIn("Setup", out)
         self.assertNotIn("navigation", out + err)
 
+    def test_brief_context_terms_do_not_change_search_hit_truth(self):
+        code, before, _ = self.cli("--json", "search", "Install", "--path", str(self.project))
+        self.assertEqual(code, 0)
+        with patch.object(am, "current_context_terms", side_effect=AssertionError("search must not extract brief context")):
+            code, after, _ = self.cli("--json", "search", "Install", "--path", str(self.project))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(after), json.loads(before))
+
     def test_cwd_no_match_identity_and_count_match_brief(self):
         with patch.object(Path, "cwd", return_value=self.project):
             brief_code, brief_out, brief_err = self.cli("brief")

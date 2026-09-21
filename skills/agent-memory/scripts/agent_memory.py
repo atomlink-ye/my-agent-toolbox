@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, shlex, sqlite3, sys
+import argparse, json, os, re, shlex, sqlite3, subprocess, sys
 from pathlib import Path
 from memory_admin import preferred_capture_root, project_inventory, tag_inventory
 from memory_doctor_ext import doctor
@@ -15,6 +15,7 @@ from memory_config import (
     flatten_bindings,
     init_settings,
     load_settings,
+    register_project,
     resolve_binding,
     resolve_project_binding,
     shared_roots,
@@ -53,6 +54,68 @@ READ_ONLY_DB_COMMANDS = {
     "brief",
     "context",
 }
+
+_CONTEXT_STOP_WORDS = {
+    "src", "lib", "test", "tests", "testing", "docs", "doc", "tmp",
+    "feature", "features", "fix", "chore", "main", "master", "develop",
+    "md", "py", "js", "ts", "tsx", "jsx", "json", "yaml", "yml",
+}
+
+
+def current_context_terms(path: Path | None = None) -> tuple[str, ...]:
+    """Collect a bounded set of Git/path metadata terms without reading file bodies."""
+    target = (path or Path.cwd()).expanduser().resolve(strict=False)
+    values: list[str] = [target.name]
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+
+    def git(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(target), *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=2,
+                env=env,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    repository = git("rev-parse", "--show-toplevel")
+    if repository:
+        values.append(Path(repository).name)
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
+        if branch and branch != "HEAD":
+            values.append(branch)
+        changed = git("status", "--porcelain=v1", "--untracked-files=normal")
+        filenames = 0
+        for line in changed.splitlines():
+            if len(line) < 4:
+                continue
+            name = line[3:].split(" -> ")[-1].strip().strip('"')
+            if name:
+                values.append(Path(name).stem)
+                filenames += 1
+                if filenames >= 16:
+                    break
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for token in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE):
+            if len(token) < 2 or token in _CONTEXT_STOP_WORDS or token in seen:
+                continue
+            seen.add(token)
+            result.append(token)
+            if len(result) >= 24:
+                return tuple(result)
+    return tuple(result)
 
 
 def _sqlite_base_error_code(error: sqlite3.Error):
@@ -278,6 +341,10 @@ def build_parser():
     snapshot_search.add_argument("--no-shared", action="store_true")
     q = sub("resolve", "resolve path")
     q.add_argument("--path", type=Path, default=Path.cwd())
+    q = sub("register", "explicitly register a project's .learnings memory root")
+    q.add_argument("--path", type=Path, default=Path.cwd())
+    q.add_argument("--project", required=True)
+    q.add_argument("--memory-root", type=Path)
     for n in ("search", "list"):
         q = sub(n, n + " memory")
         if n == "search":
@@ -415,6 +482,7 @@ def _navigation_payload(
     project_limit=4,
     tag_limit=5,
     query=None,
+    context_terms=(),
 ):
     registered = context["status"] == "resolved"
     inventory = navigation_inventory(
@@ -425,13 +493,14 @@ def _navigation_payload(
         global_limit=global_limit,
         project_limit=project_limit,
         tag_limit=tag_limit,
+        context_terms=context_terms,
     )
     state = status_name
     if not registered and status_name != "no_match":
         state = "unregistered"
     elif inventory["counts"]["distinct"] == 0 and status_name != "no_match":
         state = "empty"
-    navigation = [*inventory["global"], *inventory["project"]]
+    navigation = [*inventory["project"], *inventory["global"]]
     next_command = _scope_command("context", context, tags, include_shared)
     if tags:
         next_command = _scope_command("list", context, tags, include_shared) + " --limit 5"
@@ -451,9 +520,26 @@ def _navigation_payload(
         "counts": inventory["counts"],
         "tags": inventory["tags"] if registered else [],
         "navigation": navigation if registered else inventory["global"],
+        "project_summaries": inventory["project_summaries"] if not registered else [],
         "configured_projects": context.get("configured_projects", []),
         "omitted": inventory["omitted"],
-        "next_commands": [next_command if registered else "agent-memory projects"],
+        "diagnostics": [
+            {"code": item.get("code", "unknown"), "severity": item.get("severity", "info")}
+            for item in context.get("diagnostics", [])
+        ],
+        "diagnostic": next(
+            (
+                item.get("message", "")
+                for item in context.get("diagnostics", [])
+                if item.get("code") != "registration_suggestion"
+            ),
+            None,
+        ),
+        "next_commands": [
+            next_command
+            if registered
+            else context.get("registration_command") or "agent-memory projects"
+        ],
         "truncated": False,
     }
 
@@ -504,6 +590,14 @@ def main(argv=None):
             init_settings(sp, a.force)
             r = {"settings": str(sp)}
             _emit(r, "init", a.output_format, a.verbose)
+            return 0
+        except (MemoryError, OSError) as e:
+            print(f"agent-memory: {e}", file=sys.stderr)
+            return 2
+    if a.command == "register":
+        try:
+            result = register_project(sp, a.path, a.project, a.memory_root)
+            _emit(result, "register", a.output_format, a.verbose)
             return 0
         except (MemoryError, OSError) as e:
             print(f"agent-memory: {e}", file=sys.stderr)
@@ -663,6 +757,7 @@ def main(argv=None):
                 global_limit=2 if a.command == "brief" else 5,
                 project_limit=4 if a.command == "brief" else 15,
                 tag_limit=5 if a.command == "brief" else 10,
+                context_terms=(current_context_terms(a.path) if a.command == "brief" else ()),
             )
             _emit_bounded_payload(r, a.output_format)
             c.close()

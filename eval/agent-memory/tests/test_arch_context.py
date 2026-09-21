@@ -16,6 +16,7 @@ class ContextContractTests(unittest.TestCase):
         self.root = Path(self.tmp.name).resolve()
         self.project = self.root / "work tree" / "project"
         self.project.mkdir(parents=True)
+        (self.project / "src").mkdir()
         self.settings = {
             "version": 1,
             "bindings": [

@@ -5,13 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from memory_config import (
-    AmbiguousDescendantBindingError,
-    MemoryError,
-    UnboundPathError,
-    flatten_bindings,
-    resolve_binding,
-)
+from memory_config import MemoryError, flatten_bindings
+from memory_identity import resolve_context as resolve_identity_context
 
 
 def resolve_context(
@@ -20,49 +15,39 @@ def resolve_context(
     path: Path | None = None,
     project: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve a project and explain which identity source was used.
-
-    Unregistered results deliberately expose only up to three configured project
-    identifiers.  They never include another project's documents or metadata.
-    """
+    """Adapt the structured identity result to the CLI's stable dictionary shape."""
     if path is not None and project is not None:
         raise MemoryError("use either --project or --path, not both")
 
     bindings = flatten_bindings(settings)
     projects = sorted({binding.project for binding in bindings})
-    if project is not None:
-        if project in projects:
-            return {
-                "status": "resolved",
-                "project": project,
-                "source": "explicit_project",
-                "path": None,
-                "configured_projects": [],
-            }
-        return {
-            "status": "unregistered",
-            "project": None,
-            "source": "explicit_project",
-            "path": None,
-            "configured_projects": projects[:3],
-        }
-
-    source = "path" if path is not None else "cwd"
+    source = "explicit_project" if project is not None else "path" if path is not None else "cwd"
     target = (path or Path.cwd()).expanduser().resolve(strict=False)
-    try:
-        binding = resolve_binding(settings, target)
-    except (UnboundPathError, AmbiguousDescendantBindingError):
-        return {
-            "status": "unregistered",
-            "project": None,
-            "source": source,
-            "path": str(target),
-            "configured_projects": projects[:3],
+    identity = resolve_identity_context(settings, target, project)
+
+    diagnostics = [
+        {
+            "code": item.code,
+            "severity": item.severity,
+            "message": item.message,
         }
+        for item in identity.diagnostics
+    ]
+    registration_command = next(
+        (item.command for item in identity.diagnostics if item.command), None
+    )
+    configured_projects = (
+        []
+        if identity.status == "resolved"
+        else list(identity.aliases) or projects[:3]
+    )
     return {
-        "status": "resolved",
-        "project": binding.project,
+        "status": identity.status,
+        "project": identity.project_id,
         "source": source,
-        "path": str(target),
-        "configured_projects": [],
+        "path": None if project is not None else str(target),
+        "configured_projects": configured_projects,
+        "aliases": list(identity.aliases),
+        "diagnostics": diagnostics,
+        "registration_command": registration_command,
     }

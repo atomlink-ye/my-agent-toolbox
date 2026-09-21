@@ -15,7 +15,7 @@ sys.modules[spec.name] = am
 assert spec.loader is not None
 spec.loader.exec_module(am)
 
-from memory_format import table_dump, yaml_dump
+from memory_format import bounded_json, bounded_navigation_text, table_dump, yaml_dump
 
 
 class AgentMemoryOutputTests(unittest.TestCase):
@@ -78,6 +78,41 @@ class AgentMemoryOutputTests(unittest.TestCase):
         payload = json.loads(output)
         self.assertEqual(payload["documents"], 2)
         self.assertEqual(payload["links"], 1)
+
+    def test_navigation_briefs_are_pruned_before_candidates_and_remain_bounded(self):
+        payload = {
+            "status": "ok",
+            "project": "project",
+            "source": "path",
+            "scope": {"project": "project", "source": "path", "include_global": True, "tags": []},
+            "counts": {"distinct": 1, "global": 1, "project": 0, "components_overlap": True},
+            "tags": [],
+            "navigation": [{
+                "id": 4,
+                "scope": "_shared",
+                "title": "Shared route",
+                "brief": "oversized selected brief " * 500,
+                "path": "/memory/shared.md",
+            }],
+            "project_summaries": [],
+            "configured_projects": [],
+            "omitted": 0,
+            "next_commands": ["agent-memory context --project project"],
+            "diagnostics": [],
+            "truncated": False,
+        }
+
+        json_output = bounded_json(payload, budget=512)
+        text_output = bounded_navigation_text(payload, budget=512)
+        structured = json.loads(json_output)
+
+        self.assertLessEqual(len(json_output.encode("utf-8")), 512)
+        self.assertLessEqual(len(text_output.encode("utf-8")), 512)
+        self.assertEqual(structured["navigation"][0]["id"], 4)
+        self.assertEqual(structured["omitted"], 0)
+        self.assertLess(len(structured["navigation"][0].get("brief", "")), 100)
+        self.assertIn("Shared route", text_output)
+        self.assertIn("omitted: 0", text_output)
 
     def test_init_and_doctor_use_the_shared_formatter(self):
         fresh = self.root / "fresh-settings.json"
